@@ -527,10 +527,14 @@ Design detail belongs in `docs/`, not here. This file stays short enough to be r
    It had none, which is how the always-zero bug survived the block's original review.
    `test_gc.py` now asserts the preview equals the real sweep.
 
-**Tooling limitation worth knowing:** this project is **not a git repository**, so
-`/code-review` and `/security-review` cannot scope a diff — `security-review` refuses
-outright, and `code-review` silently falls back to scoping by file mtime, which sent it
-to review the React UI when it was asked about GC. `git init` would unlock both.
+**The project is a git repository as of the block G review** (`main`, 122 files, initial
+commit `7125959` covering blocks A–I). It was not before, and that silently broke review
+tooling: `/security-review` refuses to run outside a repo, and `/code-review` falls back
+to scoping by file **mtime** — so when asked to review GC it reviewed the React UI instead
+and returned 7 findings about the wrong block. Both agents had to review by hand.
+
+If a review agent ever reports findings that do not match the files you asked about, check
+what it scoped before trusting any of it.
 
 **Four things block G found that were wrong before it existed:**
 
