@@ -1,0 +1,82 @@
+[project]
+name = "nimbus-backend"
+version = "0.1.0"
+description = "Nimbus — API, processing worker, and GC worker"
+requires-python = ">=3.12"
+
+# One dependency set for all the Python services. They share most of these, and one
+# environment is simpler than three that drift apart.
+dependencies = [
+    # Pinned to a minor range, not `~=0.115`: PEP 440 reads that as >=0.115,==0.*, which
+    # silently admits 0.141 — and FastAPI changed yield-dependency exit scope at 0.118,
+    # which is exactly what the attachment download depends on.
+    "fastapi>=0.118,<0.142",
+    "uvicorn[standard]~=0.32", # the server that runs it
+    # The ORM. Models in api/models.py are the single description of the schema, which
+    # is also what lets `alembic revision --autogenerate` work at all.
+    "sqlalchemy[asyncio]~=2.0",
+    "asyncpg~=0.30",           # the async Postgres driver SQLAlchemy runs on
+    "redis~=5.2",              # address cache, dedup cache, snooze timers
+    "argon2-cffi~=23.1",       # password hashing (see api/security.py: why not API keys)
+    "PyJWT~=2.10",             # login tokens
+    "httpx~=0.28",             # calling reseller webhooks
+    # Settings from .env, validated on startup. Replaces hand-rolled os.getenv calls
+    # with defaults, which is how credentials ended up hardcoded in the first place.
+    "pydantic-settings~=2.7",
+    # The worker's Kafka consumer (block C). asyncio-native, which matches the async
+    # SQLAlchemy the rest of the code already uses. confluent-kafka is faster but
+    # blocking, so it would need the same thread-offload dance for no gain here.
+    #
+    # The [snappy] extra is NOT optional: franz-go, which the Go receiver uses, compresses
+    # produced batches with snappy by default. Without the codec the consumer connects,
+    # subscribes, and then dies on the first real message with UnsupportedCodecError —
+    # so the failure lands on live mail, not at startup.
+    "aiokafka[snappy]~=0.12",
+    # S3 and MinIO, one client for both — HLD §14's cloud-agnostic promise. Blocking,
+    # so calls are wrapped in stdlib asyncio.to_thread rather than adding aioboto3.
+    "boto3~=1.35",
+    "alembic~=1.14",           # database migrations
+    # Sync Postgres driver, used ONLY by Alembic. The app itself uses asyncpg.
+    # Migrations run once, on one connection, then exit — async buys nothing there,
+    # and asyncpg's prepared statements reject multi-statement SQL, which would force
+    # every migration to be split into one call per statement forever.
+    "psycopg[binary]~=3.2",
+]
+
+[dependency-groups]
+# Test-only. Kept out of `dependencies` so a production image does not ship them.
+dev = [
+    "pytest~=8.3",
+    # Lets `async def test_...` run without a decorator on every one (asyncio_mode
+    # below). Most of this codebase is async, so the alternative is boilerplate.
+    "pytest-asyncio~=0.24",
+]
+
+# A real installable package, built from src/. That is what makes `import nimbus.config`
+# work identically in the API, the worker, Alembic and the tests — before this, every
+# entry point patched sys.path by hand to find its siblings.
+#
+# src/ layout specifically: the package is NOT importable from the repo root, so a test
+# can only ever import the INSTALLED code. Without it, running pytest from `backend/`
+# would silently import the source tree instead, and a packaging mistake would show up
+# in production rather than in the test run.
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nimbus"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Async tests need no per-test decorator.
+asyncio_mode = "auto"
+# ONE event loop for the whole run, not one per test. `nimbus.db.engine` is a
+# process-wide singleton and its asyncpg pool binds to the loop that first used it, so
+# with the default per-test loop the SECOND async test in a module reuses connections
+# owned by a loop that is already closed — "RuntimeError: Event loop is closed".
+asyncio_default_test_loop_scope = "session"
+asyncio_default_fixture_loop_scope = "session"
+markers = [
+    "integration: needs the live stack — Docker, the API, the receiver and the worker",
+]

@@ -1,0 +1,220 @@
+/* Nimbus design tokens — three layers: primitive -> semantic -> component.
+ *
+ * Why three layers and not one flat list of colours: the semantic layer is what makes
+ * dark mode a 20-line override instead of a second stylesheet, and the component layer
+ * is where a widget's look changes without hunting for every rule that used a hex.
+ *
+ * Every contrast figure in the comments is MEASURED (WCAG 2.1 relative luminance), not
+ * estimated. The categorical hues were run through the dataviz palette validator; three
+ * earlier teals (#00838f, #00867d, #0e7c86) failed its chroma floor and were discarded.
+ */
+
+/* ════════════════════════ LAYER 1 · PRIMITIVE ════════════════════════
+ * Raw values. No meaning attached. These change almost never.
+ */
+:root {
+  /* Neutrals — cool and slightly blue, because this is machinery, not stationery.
+   * A warm cream ground is the house style of every AI-generated "editorial" page;
+   * it also makes a dense list of grey metadata look muddy. */
+  --n-0: #ffffff;
+  --n-25: #fbfbfa;
+  --n-50: #f4f5f6;
+  --n-100: #e9ebec;
+  --n-200: #e3e5e7;
+  --n-500: #6b7176;
+  --n-700: #5b6166;
+  --n-900: #16181a;
+
+  --nd-900: #141516;
+  --nd-800: #1c1e20;
+  --nd-700: #2b2f33;
+  --nd-600: #232629;
+  --nd-300: #868e95;
+  --nd-200: #a3abb2;
+  --nd-50: #eceef0;
+
+  /* Teal ramp — the ONLY brand hue. One hue, because in a dense list colour is the
+   * scarcest signal there is; spending it on branding leaves none for meaning. */
+  --t-100: #dff2f4;
+  --t-200: #a9dfe5;
+  --t-500: #0097a7;
+  --t-700: #00707c;
+  --t-300d: #22b8c4;
+  --t-400d: #18a8b5;
+  --t-800d: #134e57;
+  --t-900d: #0e2f36;
+
+  /* Status — reserved. These four never become "series 3". Each always ships with a
+   * word beside it, so meaning never rests on hue alone. */
+  --s-good: #0f7a3d;
+  --s-warn: #a15c00;
+  --s-crit: #c2401f;
+  --s-good-d: #4fbb7a;
+  --s-warn-d: #e0a33a;
+  --s-crit-d: #f08a6b;
+
+  /* Type. The sans/mono split is the design's organising rule, not decoration:
+   * sans carries what a person wrote, mono carries what the system computed. */
+  --f-sans: "IBM Plex Sans Variable", system-ui, -apple-system, sans-serif;
+  --f-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  --fs-1: 12px;   /* mono micro-labels. The floor — never smaller. */
+  --fs-2: 13px;   /* row metadata */
+  --fs-3: 14px;   /* row subject, UI default */
+  --fs-4: 16px;   /* message body — the one real reading surface */
+  --fs-5: 17px;   /* message subject heading */
+  --fs-6: 22px;   /* page title */
+  --fs-hero: 44px;
+
+  --lh-tight: 1.25;
+  --lh-ui: 1.4;
+  --lh-read: 1.65;
+
+  --fw-reg: 400;
+  --fw-med: 500;
+  --fw-semi: 600;
+
+  /* Space — density 8/10. A mail client is read, not browsed. */
+  --sp-1: 2px;
+  --sp-2: 4px;
+  --sp-3: 6px;
+  --sp-4: 8px;
+  --sp-5: 12px;
+  --sp-6: 16px;
+  --sp-7: 24px;
+  --sp-8: 32px;
+
+  --r-1: 2px;
+  --r-2: 4px;
+  --r-3: 8px;
+
+  --dur-fast: 120ms;
+  --dur-base: 160ms;
+  --ease: cubic-bezier(0.2, 0, 0.2, 1);
+}
+
+/* ════════════════════════ LAYER 2 · SEMANTIC ═════════════════════════
+ * Purpose, not appearance. This is the only layer dark mode overrides.
+ */
+:root {
+  color-scheme: light;
+
+  --bg-page: var(--n-25);
+  --bg-raised: var(--n-0);
+  --bg-hover: var(--n-50);
+  --bg-selected: var(--t-100);
+  --bg-sunken: var(--n-50);
+
+  --ink: var(--n-900);      /* 17.19:1 on page */
+  --ink-2: var(--n-700);    /*  6.06:1 */
+  --ink-3: var(--n-500);    /*  4.77:1 — the AA floor for metadata text.
+                             * An earlier #7c8288 measured 3.75 and FAILED. */
+  --rule: var(--n-200);
+
+  --accent: var(--t-500);        /* 3.39:1 — MARKS ONLY. Never text. */
+  --accent-text: var(--t-700);   /* 5.62:1 — links, unread dot, focus */
+  --track: var(--t-200);         /* meter/bar track: a lighter step of the fill's
+                                  * own ramp, so state reads across the whole bar */
+  --focus: var(--t-700);
+
+  --good: var(--s-good);   /* 5.24:1 */
+  --warn: var(--s-warn);   /* 5.01:1 */
+  --crit: var(--s-crit);   /* 5.01:1 */
+}
+
+/* Dark declared under BOTH scopes. The media query covers the OS setting; the
+ * data-theme scope covers the in-app toggle, which must beat the OS in both
+ * directions. The :not() guard is what lets an explicit "light" win over OS-dark. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg-page: var(--nd-900);
+    --bg-raised: var(--nd-800);
+    --bg-hover: var(--nd-600);
+    --bg-selected: var(--t-900d);
+    --bg-sunken: var(--nd-900);
+    --ink: var(--nd-50);      /* 15.72:1 */
+    --ink-2: var(--nd-200);   /*  7.86:1 */
+    --ink-3: var(--nd-300);   /*  5.50:1 */
+    --rule: var(--nd-700);
+    --accent: var(--t-400d);       /* 6.36:1 */
+    --accent-text: var(--t-300d);  /* 7.59:1 */
+    --track: var(--t-800d);
+    --focus: var(--t-300d);
+    --good: var(--s-good-d);
+    --warn: var(--s-warn-d);
+    --crit: var(--s-crit-d);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg-page: var(--nd-900);
+  --bg-raised: var(--nd-800);
+  --bg-hover: var(--nd-600);
+  --bg-selected: var(--t-900d);
+  --bg-sunken: var(--nd-900);
+  --ink: var(--nd-50);
+  --ink-2: var(--nd-200);
+  --ink-3: var(--nd-300);
+  --rule: var(--nd-700);
+  --accent: var(--t-400d);
+  --accent-text: var(--t-300d);
+  --track: var(--t-800d);
+  --focus: var(--t-300d);
+  --good: var(--s-good-d);
+  --warn: var(--s-warn-d);
+  --crit: var(--s-crit-d);
+}
+
+/* ════════════════════════ LAYER 3 · COMPONENT ════════════════════════
+ * Only for widgets that actually exist. No token for a component we did not build.
+ */
+:root {
+  --row-h: 36px;
+  --row-pad-x: var(--sp-5);
+  --row-dot: var(--accent-text);
+
+  --chip-bg: var(--bg-hover);
+  --chip-radius: var(--r-1);
+
+  --bar-h: 20px;
+  --bar-gap: 2px;          /* the surface gap that separates touching marks */
+  --bar-track: var(--track);
+  --bar-fill: var(--accent);
+
+  --dialog-bg: var(--bg-raised);
+  --dialog-radius: var(--r-3);
+  --dialog-shadow: 0 8px 32px rgb(0 0 0 / 0.18);  /* the ONLY shadow in the product */
+
+  --btn-fg: var(--ink-2);
+  --btn-hover-bg: var(--bg-hover);
+  --btn-pad: var(--sp-3) var(--sp-5);
+  --btn-radius: var(--r-2);
+
+  --input-bg: var(--bg-raised);
+  --input-border: var(--rule);
+  --input-pad: var(--sp-4) var(--sp-5);
+  --input-radius: var(--r-2);
+
+  --focus-ring: 2px solid var(--focus);
+  --focus-offset: 2px;
+
+  --rail-w: 208px;
+  --list-w: 380px;
+}
+
+/* A 36px row is comfortable with a mouse and too small for a thumb. One media query
+ * resolves it instead of shipping a separate mobile layout. */
+@media (pointer: coarse) {
+  :root {
+    --row-h: 48px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-base: 0ms;
+  }
+}

@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Nimbus</title>
+    <!-- Inline so there is no extra request and no 404 in the console. The mark is the
+         fingerprint strip: the product's own idea, at 16px. -->
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%2300707c'/%3E%3Cg fill='%23fff'%3E%3Crect x='3' y='4' width='2' height='8'/%3E%3Crect x='7' y='4' width='2' height='8' opacity='.45'/%3E%3Crect x='11' y='4' width='2' height='8'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <script>
+      // Inline and before the stylesheet on purpose: stamping data-theme after first
+      // paint makes a dark-mode user watch a white page flash. Three lines here beats
+      // any amount of cleverness later.
+      try {
+        var t = localStorage.getItem("nimbus-theme");
+        if (t === "light" || t === "dark") document.documentElement.dataset.theme = t;
+      } catch (_) {
+        /* private mode denies localStorage; the OS preference still applies */
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

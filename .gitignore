@@ -1,0 +1,29 @@
+# Secrets. .env.example is the committed template; .env never is.
+.env
+*.env
+!*.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Tool caches. .mypy_cache alone is 173 MB — bigger than everything we actually
+# wrote, and it rebuilds itself, so it has no business in the history.
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.playwright-mcp/
+
+# Node. frontend/.gitignore covers these too; repeated here so the root is the
+# one place to look.
+node_modules/
+dist/
+
+# Go
+smtp-receiver.exe
+snooze.exe
+
+# Local scratch
+*.log

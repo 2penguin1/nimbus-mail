@@ -1,0 +1,101 @@
+# Nimbus local stack — everything the project needs, nothing else.
+#
+#   docker compose -f infra/docker-compose.yml up -d
+#
+# Ports are the standard ones so psql / redis-cli / a browser all work from the host
+# with no extra flags.
+
+name: nimbus
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nimbus
+      POSTGRES_PASSWORD: nimbus
+      POSTGRES_DB: nimbus
+    ports:
+      # host:container. 5433 on the host because a natively installed PostgreSQL
+      # already owns 5432 on this machine. Inside the Docker network other containers
+      # still reach this as postgres:5432 — only the door from Windows moved.
+      - "5433:5432"
+    volumes:
+      - pg:/var/lib/postgresql/data
+      # No schema.sql mount. Alembic owns the schema now:
+      #     cd backend && uv run alembic upgrade head
+      # The old auto-init only ran on a fresh volume, so every schema change meant
+      # wiping the database. Migrations apply to a live one.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nimbus"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      # 6380 on the host — a native redis-server already owns 6379 here.
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: nimbus
+      MINIO_ROOT_PASSWORD: nimbus-dev-secret
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # web console
+    volumes:
+      - minio:/data
+
+  # Creates the buckets, then exits. Without this the worker has nowhere to put chunks.
+  # It retries instead of using a healthcheck — MinIO's health probe differs between
+  # image releases, and a retry loop cannot go stale.
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 nimbus nimbus-dev-secret; do sleep 1; done &&
+      mc mb --ignore-existing local/nimbus-chunks &&
+      mc mb --ignore-existing local/nimbus-raw &&
+      echo 'buckets ready'
+      "
+
+  redpanda:
+    # Pinned for reproducibility. If this tag ever fails to pull, bump it — nothing
+    # in our code depends on the exact version.
+    image: docker.redpanda.com/redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda
+      - start
+      - --mode dev-container      # relaxed settings, single node, no tuning needed
+      - --smp 1
+      - --memory 1G
+      # Two listeners on purpose:
+      #   internal -> other containers connect to  redpanda:9092
+      #   external -> your machine connects to     localhost:19092
+      # One listener cannot serve both, because the address the broker advertises
+      # has to be resolvable by whoever asked.
+      - --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"   # Kafka API, from the host
+      - "9644:9644"     # admin API
+    volumes:
+      - redpanda:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  pg:
+  minio:
+  redpanda:
