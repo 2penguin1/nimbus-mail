@@ -603,12 +603,12 @@ what it scoped before trusting any of it.
   **68.8% dedup (R1)**, **500 msg/min held** with a peak backlog of 6 and a final backlog
   of zero. Reviewed by two skills-loaded agents — 16 findings, 15 applied, 2 rejected with
   evidence. HLD §13 now carries all six numbers; §13.1 defines the corpus.
-- **Owed on block J: the re-run on the post-review build.** The figures above come from the
-  run that completed BEFORE review added the three absolute-byte checks. They are not
-  suspect — the reviewer independently predicted 863,750,806 physical bytes and the run
-  measured exactly that — but the agreement was checked by hand, not by the run. A re-run
-  was started and killed externally at 8,859/10,000; `--cleanup` removed its data and the
-  database returned to its exact prior baseline (verified). HLD §13.4 records this.
+  Re-run on the post-review build confirms it: **all 11 checks pass**, and the three
+  absolute byte totals land exactly on the values the reviewer computed independently from
+  the corpus definition (863,750,806 / 2,766,734,026 / 10,730,417,228). An earlier attempt
+  was killed externally at 8,859/10,000; `--cleanup` removed its data and the database
+  returned to its exact prior baseline — which incidentally proved the cleanup path at
+  scale, name guard included.
 
 **Five rules block J establishes:**
 
@@ -655,9 +655,14 @@ what it scoped before trusting any of it.
    sub-chunk saving measured ≈ 0 — every saved byte came from whole files being sent to
    many people. That is a floor for content-defined chunking, not a ceiling, and it makes
    §16's first open question sharper rather than answered.
-3. **One worker consumed all 4 Kafka partitions at 500/min without breaking a sweat** —
-   peak backlog 6 messages. The 4-partition ceiling on the consumer group is therefore
-   still untested, and the queue-depth curve is the instrument that would expose it.
+3. **The ceiling is 1,417 msg/min durable, and the WORKER is the bottleneck.** Found by
+   offering 6,000/min: the receiver accepted 2,959/min and was never saturated (the driver
+   hit 102.7 s of schedule debt and flagged itself as the constraint), while one Python
+   worker stored 1,417/min doing MIME parse, chunk, SHA-256, dedup, fan-out and indexing.
+   Backlog peaked at 5,777 and drained to **zero with all 11 integrity checks passing** —
+   saturation costs latency, not correctness, which is what the Kafka spool is for. One
+   worker consumes all 4 partitions, so the group scales to 4 without a repartition
+   (~5,700/min if linear, untested). **Block K should size against 1,417, not 500.**
 
 **Three things block F fixed that were latent in the schema from day one:**
 

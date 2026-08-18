@@ -1184,7 +1184,7 @@ the rest were settled by the blocks that built them.
 | Metric | Target | Measured |
 |---|---|---|
 | Dedup ratio on realistic data | > 60% storage saved | **68.8%** on 10,000 messages, seed 42 (§13.1) |
-| SMTP ingest rate | > 500 messages/min sustained | **500/min held**, peak backlog 6 messages, final 0 (§13.2) |
+| SMTP ingest rate | > 500 messages/min sustained | **500/min held**, peak backlog 6, final 0. Ceiling measured separately at **1,417/min** durable — 2.8x the target, worker-bound (§13.2) |
 | Receiver memory with 25 MB attachments | Flat — no growth with attachment size | 212 MB of concurrent mail through 84 MB RSS (block B) |
 | Search p95 (100k-message mailbox) | < 100 ms | **5 ms typical, 73–76 ms worst** (block F) |
 | Snooze accuracy | **exact.** Nothing fires — `snooze_until > now()` is evaluated at read time, so there is no timer to be late (§9.5) | exact by construction |
@@ -1242,8 +1242,38 @@ open question stays open.
 
 500 msg/min is the rate the driver **offered**; the system held it with a peak backlog of
 6 messages and a final backlog of zero, at 0.0 s of schedule debt. That proves the target.
-It is **not** the ceiling — nothing was saturated. Finding the maximum means raising
-`--rate` until the check fails, which block K's sizing needs and this run did not do.
+
+**The ceiling is a separate run**, found by offering far more than the system can take:
+
+```
+uv run python scripts/loadtest.py --messages 10000 --rate 6000 --threads 64 --seed 42
+```
+
+| | Result |
+|---|---|
+| Durably stored | **1,417 msg/min** — 2.8x the §13 target |
+| Accepted by the receiver | 2,959 msg/min — **a floor, not its ceiling** (see below) |
+| Peak queue depth | 5,777 messages |
+| Final queue depth | **0** — the backlog drained completely |
+| Integrity checks | **all 11 passed under saturation** |
+
+**The worker is the bottleneck, not the receiver.** The receiver accepted twice what the
+worker could store, and it was never itself saturated: the driver reached 102.7 s of
+schedule debt and reported itself as the constraint, so 2,959 msg/min is the fastest the
+*driver* could offer, not the fastest the receiver could take. What 1,417 measures is one
+Python worker doing MIME parsing, chunking, SHA-256, dedup, fan-out and search indexing.
+
+**Nothing broke at 2.8x.** The backlog grew to 5,777 and drained to zero with every
+integrity check passing and no retries. Saturation cost latency, not correctness — which is
+the behaviour the Kafka spool exists to provide (§7). The dedup figures were byte-identical
+to the paced run, confirming §13.1's claim that the ratio is a property of the corpus and
+not of the rate.
+
+**What this does not tell us.** One worker consumes all four Kafka partitions, so the
+consumer group could scale to four workers without a repartition — roughly 5,700 msg/min if
+it scales linearly, which is untested. Beyond four, `mail.received` needs more partitions.
+That is the next thing to know, and block K's sizing decision (§9.1a) should be made against
+1,417, not against 500.
 
 Two distinctions the script is built around, both of which flatter the number if blurred:
 
@@ -1283,25 +1313,44 @@ generator ship with the number.
 `backend/tests/unit/test_loadtest_corpus.py` asserts the predicted ratios offline, so the
 figures above cannot drift away from the code without a test failing.
 
-### 13.4 Which build produced these numbers
+### 13.4 What the run actually asserts
 
-Stated because it matters and would otherwise be invisible. The 10,000-message run that
-produced 68.8% / 500 msg/min completed on the build **before** review. That build had 8
-integrity checks; review then added 3 more, comparing the **absolute** byte totals against
-the corpus prediction rather than only their ratio (§13.1's arithmetic cancels a scaled
-error, so the ratio alone cannot catch one).
+Eleven checks, all against the driver's own plan rather than the database's internal
+consistency — a self-consistent database missing 400 messages passes every internal check
+and reports a *better* dedup ratio than the truth.
 
-The gap does not invalidate the figures, and there is a specific reason to say so rather
-than assert it. The reviewer independently computed seed 42's expected physical total as
-**863,750,806 bytes** from the corpus definition; the run measured **863,750,806**, and the
-per-message and per-copy totals matched their predictions the same way. So the checks that
-were missing would have passed. But that agreement was verified by hand after the fact, not
-by the run itself.
+| Check | Seed 42 |
+|---|---|
+| messages stored | 10,000 |
+| copies delivered | 39,497 |
+| attachments recorded | 3,000 |
+| search index rows | 39,497 |
+| distinct files stored (blobs) | 720 |
+| blob refcount sum | 11,643 |
+| chunk refcount sum | 811 |
+| S3 chunk bytes == chunk table | 863,750,806 |
+| **physical bytes stored** | **863,750,806** |
+| **logical bytes, per message** | **2,766,734,026** |
+| **logical bytes, per copy** | **10,730,417,228** |
 
-**The re-run on the checked build is still owed.** It was started and killed externally at
-8,859 of 10,000 messages; its data was removed with `--cleanup` and the database returned
-to its exact prior baseline. Anyone repeating this should run the command in §13.3 and
-confirm all 11 checks pass before quoting the numbers as machine-verified.
+**The last three exist because a ratio cannot check itself.** R1 is
+`1 - physical / logical`, so an error scaling both sides cancels exactly. If the worker
+regressed to storing base64-encoded bytes instead of decoded ones — the mistake
+`mime.attachments()` is written to prevent — then every count, every refcount, the
+S3-versus-database cross-check and R1 itself would be unchanged, while 37% of the chunk
+store was wasted and every mailbox's `physical_bytes` on the dashboard was inflated. Only
+comparing the absolute totals against the corpus prediction catches it. This was found by
+review *after* the first eight checks were written and the first run had already passed.
+
+Two other checks are worth knowing the reason for:
+
+- **`search index rows == copies`.** Block F writes `message_index` inside a SAVEPOINT and
+  deliberately swallows non-transient failures, so a perfect dedup ratio is entirely
+  compatible with zero searchable mail. Nothing else in the report would notice.
+- **`messages stored == N` exactly, not `>= N`.** A `451` retry makes the receiver write a
+  *new* random `raw_s3_key`, so `processed_event` — keyed on that key — does not recognise
+  it as a duplicate. The retry becomes a second message carrying the same attachment: a
+  free dedup hit and one message too many.
 
 **The standard run is 10,000 messages, not the 100,000 §15 originally named.** 100k costs
 ~59 GB — 47 GB of it the raw `.eml` archive — and 3.5 hours on a laptop that is also
@@ -1387,7 +1436,7 @@ wait for.
 | **G** | ~~Quota (logical vs physical) + garbage collection worker~~ **DONE** — `GET /v1/quota`, three-phase sweep in `nimbus/gc.py` with `--dry-run`. Migration `9c3e5a1d7b42` adds the grace clock the design always assumed existed. Verified live: a sweep leaves a shared attachment byte-identical for the mailbox still holding it, a doubly-referenced chunk reaches 0, no refcount goes negative, `used_bytes` reconciles. | D | **high** |
 | **H** | ~~Snooze — Redis sorted set + Go worker~~ **DONE, and it is none of those things.** Snooze is the predicate `snooze_until > now()`, evaluated at read time. Migration `c81f4e6a29d3` drops `is_snoozed`; `PATCH` gains `snooze_until`; the list gains `?snoozed=`. No Redis, no worker, no poll, no lock, no leader election. Verified: a message snoozed for 3 seconds returned by itself with nothing running. | D | medium |
 | **I** | ~~React UI + savings dashboard~~ **DONE** — Vite + React 19 + TypeScript, 5 runtime dependencies, 6 screens. Sender HTML renders in a sandboxed iframe with a prepended CSP; verified against crafted hostile mail that every vector is blocked by the browser. Storage screen shows logical vs physical with both §11.1 caveats. No compose, anywhere. | E F G H | medium |
-| **J** | ~~Load test — 100k messages, measure everything in §13~~ **DONE** — `scripts/loadtest.py`: a seeded corpus generator, a paced SMTP driver and a measurement pass, in one operator script with no new dependencies. It measures the **two** §13 numbers that were unproven; the other four were settled by the blocks that built them, so "everything in §13" was never this script's job. Standard run is **10,000** messages, not 100k — §13.3 says why. Verified: 68.8% dedup, 500 msg/min held, 8 integrity checks passing — see §13.4 on which build produced that run. | D | medium |
+| **J** | ~~Load test — 100k messages, measure everything in §13~~ **DONE** — `scripts/loadtest.py`: a seeded corpus generator, a paced SMTP driver and a measurement pass, in one operator script with no new dependencies. It measures the **two** §13 numbers that were unproven; the other four were settled by the blocks that built them, so "everything in §13" was never this script's job. Standard run is **10,000** messages, not 100k — §13.3 says why. Verified: 68.8% dedup, 500 msg/min held, all 11 integrity checks passing (§13.4). | D | medium |
 | **K** | AWS deploy, README, architecture diagram | J | low |
 
 **Critical path:** A → B → C → D. Everything interesting hangs off D, so get there first.

@@ -369,9 +369,16 @@ Measured, that raw pile was **4.4 times bigger** than the deduplicated store. So
 saving on the disk you actually pay for is **68.4% today, and 94.2% once the 7-day
 copies expire**. The bigger number is real, it just arrives a week late.
 
-**One thing this does not tell us.** 500 emails a minute is the rate we *asked* for, and
-the system kept up without straining. It is not the maximum — we never found the ceiling.
-That matters for choosing the size of the server in the final step.
+**We also found the maximum.** 500 a minute is what we *asked* for, and the system kept up
+without straining. So we asked for 6,000 a minute to see where it breaks. It stored
+**1,417 a minute** — nearly three times the target — and the part that ran out of road was
+the **worker** (the brain), not the receiver (the part taking mail off the wire). The
+receiver was still accepting twice what the worker could store.
+
+The important half of that result is what did *not* happen. At three times the target the
+queue built up to 5,777 waiting emails — and then drained to zero, with every one of the
+eleven correctness checks still passing and not a single email lost. Overloading it made it
+slow, not wrong. That is exactly the job the queue exists to do.
 
 ---
 
