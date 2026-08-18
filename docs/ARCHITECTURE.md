@@ -1,8 +1,8 @@
 # Nimbus — Architecture in Diagrams
 
-**Version:** 1.6
+**Version:** 1.7
 **Author:** Sujal Kumar Singh
-**Last updated:** 2026-08-18
+**Last updated:** 2026-08-19
 
 Every part of the system, drawn. Almost no prose — each diagram gets one line saying
 what it shows and a few points that matter.
@@ -37,6 +37,7 @@ what it shows and a few points that matter.
 | 19 | Provisioning without double-creating |
 | 20 | Build order |
 | 21 | The load test: which bytes each ratio divides |
+| 22 | Who can do what — the three tiers, and the domain check (**planned**) |
 
 ---
 
@@ -1076,6 +1077,88 @@ over deleting it in GC, and R3' is what the store looks like once that rule fire
    So the run also checks the ABSOLUTE totals against the corpus prediction,
    not just their quotient. Found by review, after the checks were written.
 ```
+
+---
+
+## 22. Who can do what — the three tiers, and the domain check
+
+**Everything marked `L1`/`L2` is PLANNED, not built.** HLD §9.6a and §9.8 are the design.
+Drawn now because the gap it shows is real today: only the bottom tier has a UI, and the
+domain check does not exist at all.
+
+```
+  TIER              CREATED BY                       SURFACE TODAY
+ ─────────────────────────────────────────────────────────────────────────
+  organization      scripts/create_reseller.py       CLI on the server only
+   (reseller)       prints an API key, once          no endpoint, no UI
+        │
+        │ owns
+        ▼
+  domain +          POST /v1/orders                  reseller API key
+  mailboxes         one transaction, idempotent      no UI
+        │
+        │ owns
+        ▼
+  mailbox holder    provisioned by the order above   React webmail, 5 screens
+                                                     /login /mail /threads
+                                                     /search /storage
+```
+
+Where the domain check inserts itself, and why the receiver needs no change:
+
+```
+   POST /v1/orders
+        │
+        ▼
+   domain row created,  verified = false
+        │
+        │               addresses NOT published  ◄── the enforcement, in one filter
+        ▼
+   challenge = base32(HMAC(JWT_SECRET, "nimbus-domain-verify:" + domain_id))
+        │
+        │   reseller publishes TXT _nimbus-challenge.acme.com
+        ▼
+   POST /v1/domains/{id}/verify          L1
+        │
+        ├─ resolve TXT ─── no record ──► 404 "not found yet, DNS may be propagating"
+        ├─              ── mismatch  ──► 409 "value does not match"
+        ├─              ── timeout   ──► 503 (a resolver problem, not a failed check)
+        └─ match ──► verified = true, COMMIT, then publish addresses
+                              │
+                              ▼
+                     Redis valid_addresses  ──►  Go receiver answers RCPT TO
+                                                 UNCHANGED — an unverified domain's
+                                                 addresses are simply not in the set,
+                                                 so it already answers 550
+```
+
+| Piece | Changes for L1 |
+|---|---|
+| `api/addresses.py` | three `.where(Domain.verified)` clauses on joins that already exist |
+| `api/routers/orders.py` | publish addresses only for a verified domain |
+| `api/routers/domains.py` | **new** — list + verify |
+| migration | grandfather every existing row to `verified = true` |
+| `smtp-receiver/` | **nothing** |
+
+Deprovisioning, which L2 exposes and the database already does:
+
+```
+  DELETE /v1/domains/{id}          L2
+        │
+        ▼
+   domain ─CASCADE─► mailbox ─CASCADE─► mailbox_message
+                                              │
+                     AFTER DELETE FOR EACH ROW▼
+                        blob.refcount--   used_bytes--
+                                              │
+                                              ▼
+                                    refcount 0 ─► nimbus.gc frees the bytes
+```
+
+Deleting an **organization** is the exception — `blob`/`chunk`/`message` reference
+`reseller` with `RESTRICT`, so it is staged: delete domains, run GC, then delete the
+reseller. Skipping the middle step aborts loudly on the foreign key. That is the
+constraint working, not a bug to loosen.
 
 ---
 

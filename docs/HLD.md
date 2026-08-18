@@ -1,8 +1,8 @@
 # Nimbus — High Level Design
 
-**Version:** 1.5 (living document — expect this to change as we build)
+**Version:** 1.6 (living document — expect this to change as we build)
 **Author:** Sujal Kumar Singh
-**Last updated:** 2026-08-18
+**Last updated:** 2026-08-19
 
 > **New here? Do not start with this file.**
 > `OVERVIEW.md` explains the system in plain English. `ARCHITECTURE.md` draws every
@@ -546,6 +546,13 @@ tested, but the rows can currently only be created by hand. The member-managemen
 endpoints belong with the reseller API; until they exist this feature is **inert**, the
 same way `forwarding_rule` is. Recorded so the docs do not describe it as working.
 
+⚠️ **`domain.verified` is inert too, and it is the dangerous one.** The column exists,
+defaults to `false`, and nothing has ever written or read it — so domain ownership is
+unchecked and `domain.name` is first-come-wins. Unlike the two above, this is a security
+control that looks present and is not, which is worse than an absent feature: a reader
+sees the column and assumes a check exists. **Block L1 closes it** — see §9.6a for the
+design and why it lands before the deploy.
+
 **Every resolved mailbox is re-checked against the reseller before delivery.**
 `alias.target_mailbox_id` and `domain.catch_all_mailbox_id` are plain foreign keys to
 `mailbox.id`, so the schema permits either to point into a different tenant. Nothing can
@@ -802,6 +809,109 @@ created twice", not "secrets are repeatable".
 - Swapped atomically (build a temp key, `RENAME` over the live one). A plain
   delete-then-fill leaves a window where the set is empty and every message is rejected.
 
+### 9.6a Domain ownership verification (planned — block L1, lands BEFORE the deploy)
+
+**The hole.** `domain.verified` has sat in the schema since the initial migration (§8).
+Nothing has ever set it and nothing has ever read it. `domain.name` carries a global
+`UNIQUE` constraint, so the live rule today is first-come-wins: any reseller holding any
+valid API key can `POST /v1/orders` for `google.com` and own it, in this system, for good.
+
+Right-sized honestly, because overstating this would be as wrong as ignoring it: the
+blast radius is **not** "anyone on the internet". Reseller keys are issued by hand
+(§9.8), so the actor has to be a tenant we onboarded ourselves. What changes at block K
+is the consequence. Behind a real MX record, "claimed a domain it does not own" stops
+being a wrong database row and becomes a mail server accepting somebody else's mail.
+That is why this lands before the deploy and not after.
+
+**The design in one line:** prove control of the domain's DNS, then let the address
+cache do the enforcing.
+
+```
+ reseller                      Nimbus API                    DNS
+    |                              |                          |
+    |-- POST /v1/orders ---------->|                          |
+    |<-- 201 + challenge token ----|  domain.verified = false |
+    |                              |  addresses NOT published |
+    |                                                         |
+    |-- publish TXT _nimbus-challenge.acme.com = <token> ---->|
+    |                              |                          |
+    |-- POST /v1/domains/{id}/verify ->|                       |
+    |                              |-- resolve TXT ---------->|
+    |                              |<-- record --------------|
+    |                              |  compare, constant time  |
+    |                              |  verified = true, COMMIT |
+    |                              |  publish addresses       |
+    |<-- 200 {verified: true} -----|                          |
+```
+
+**The challenge token is derived, not stored.**
+
+```
+token = base32( HMAC-SHA256(JWT_SECRET, b"nimbus-domain-verify:" + domain_id) )
+```
+
+No column, no migration, no expiry to manage, and it is stable across restarts so a
+reseller can re-read it whenever they like. The `nimbus-domain-verify:` prefix is domain
+separation — it is what guarantees this value can never collide with a session token
+signed by the same secret. **Trade-off:** the token cannot be rotated without rotating
+`JWT_SECRET`. Accepted, because a leaked challenge proves nothing on its own — using it
+still requires write access to the DNS zone.
+
+**Enforcement is free, and that is the whole reason this design stays small.**
+`api/addresses.py` already joins `Mailbox → Domain` and `Alias → Domain` to build the
+Redis set the receiver answers `RCPT TO` from. Verification becomes three `.where()`
+clauses on those existing joins plus one guard in `orders.py`:
+
+| Place | Change |
+|---|---|
+| `addresses.refresh()` | `.where(Domain.verified)` on both address selects and on `catch_alls` |
+| `orders.py` | call `addresses.add()` only for a verified domain |
+| `smtp-receiver/` | **nothing** |
+
+An unverified domain's addresses are simply absent from `valid_addresses`, so the Go
+receiver answers `550` through the path it already has. No new check at the SMTP
+boundary, no second source of truth, and the existing startup rebuild heals the cache
+for free.
+
+**The three questions.**
+
+| Question | Answer |
+|---|---|
+| Second time? | Idempotent. Re-verifying an already-verified domain re-reads DNS, matches, and returns the same `200`. |
+| Crashes halfway? | `verified = true` commits before the Redis write, same ordering as §9.6. A lost cache write is healed by the next API startup rebuild. |
+| At 100x? | DNS lookups are operator-initiated, one per `verify` call, never per message. Per-message cost is unchanged — it is still one Redis `SISMEMBER` that already happens. |
+
+**What this deliberately does not do.**
+
+- **No re-verification.** A domain that deletes its TXT record after passing stays
+  verified for ever. Re-checking needs a scheduled job and a policy for what to do with
+  in-flight mail when a domain lapses. `# ponytail: verify once, add a re-check sweep if
+  a tenant ever loses a domain and keeps receiving its mail.`
+- **It proves DNS control, not ownership.** Whoever can write the zone passes. That is
+  the same bar Google Workspace, AWS SES and Let's Encrypt set, and it is the strongest
+  claim DNS can support.
+- **No SPF/DMARC checking.** Still §16's open question, unchanged by this.
+
+**The migration trap — read this before writing the code.** Every existing `domain` row
+has `verified = false`. Turning enforcement on without a data migration removes every
+current address from `valid_addresses` and the system silently stops accepting all mail.
+The migration must grandfather what already exists:
+
+```sql
+UPDATE domain SET verified = true;   -- everything provisioned before enforcement existed
+```
+
+**New dependency.**
+
+| Package | Why |
+|---|---|
+| `dnspython` | Python has no stdlib TXT lookup — `socket` resolves names to addresses only. DNS is a binary protocol over UDP with truncation-and-retry-over-TCP; hand-writing a resolver is exactly what code rule 3 forbids. |
+
+`verify` must distinguish its failures, because DNS propagation means the first attempt
+routinely fails on a correctly configured domain: `NXDOMAIN`/no TXT → "record not found
+yet, retry"; TXT present but wrong → "value does not match"; resolver timeout → `503`,
+not a verification failure.
+
 ### 9.7 Garbage collection
 
 **Built and verified (block G).** `uv run python -m nimbus.gc [--dry-run]` — one sweep,
@@ -980,6 +1090,94 @@ Phase 1 collects it because it has no `mailbox_message` rows.
 
 ---
 
+### 9.8 The management surface (planned — block L2, lands AFTER the deploy)
+
+**The gap, stated plainly.** Nimbus has three kinds of user and only the bottom one has
+a face.
+
+| Tier | Who | Created today by | Has a UI? |
+|---|---|---|---|
+| **Organization** (`reseller`) | The paying tenant | `scripts/create_reseller.py` on the server — CLI only, no endpoint anywhere | No |
+| **Domain + mailboxes** | The organization | `POST /v1/orders` with the API key | No |
+| **Mailbox holder** | An employee | Provisioned by the order above | Yes — all 5 screens (block I) |
+
+So onboarding a customer today requires SSH access to the box. The React app's five
+routes (`/login`, `/mail`, `/threads`, `/search`, `/storage`) are all webmail for the
+bottom tier.
+
+**Two of these endpoints are already promised.** §10.2 lists
+`GET /domains/{domain}/mailboxes` and `DELETE /mailboxes/{id}` as part of the API
+surface. Neither exists — the router directory has 12 endpoints, not 14. That is a
+documentation defect this block closes by building them, and it is recorded here rather
+than quietly corrected because a doc that over-claims is the thing this project is
+supposed to avoid.
+
+**The whole system is create-only.** There is no list, no update and no delete at any
+tier above a single message. An employee leaves and there is no way to remove their
+mailbox except raw SQL. In a platform whose entire value is refcounted storage, the
+operation that *releases* storage has no API.
+
+**The database is already ready for it, and this is the good news.** The cascade chain
+plus the row-level trigger were built for exactly this in the initial migration:
+
+```
+DELETE reseller ─CASCADE─► domain ─CASCADE─► mailbox ─CASCADE─► mailbox_message
+                                                                      │
+                                            AFTER DELETE FOR EACH ROW ▼
+                                          blob.refcount-- , used_bytes--
+```
+
+The migration comment names paths 2 and 3 ("a mailbox is deprovisioned", "a domain is
+deleted") as the reason the trigger is in the database instead of in application code,
+and block A proved all three paths live (3→2→1→0). Block L2 writes the HTTP surface over
+machinery that already works; it does not touch the storage engine.
+
+**Deleting an organization is the one operation that is not a cascade.** `blob`, `chunk`
+and `message` reference `reseller` with `ON DELETE RESTRICT`, so it is a staged sequence
+and cannot be anything else:
+
+| Step | What happens | If skipped |
+|---|---|---|
+| 1. Delete the domains | Cascades to mailboxes and `mailbox_message`; the trigger drives every `blob.refcount` to 0 | — |
+| 2. Run `nimbus.gc` | Frees the zero-refcount blobs, chunks and their S3 objects | Step 3 aborts on the FK |
+| 3. Delete the reseller row | Succeeds, because nothing references it any more | Loud `ForeignKeyViolation`, no data lost |
+
+The `RESTRICT` is doing its job here: the failure mode of getting this wrong is a noisy
+abort, never orphaned bytes. Do not "fix" it by loosening the constraint.
+
+**Scope: six endpoints, no new UI, no new auth tier.** All under the existing reseller
+API key.
+
+| Method | Path | Block |
+|---|---|---|
+| `GET` | `/v1/domains` | L1 — list mine, with `verified` and the challenge token |
+| `POST` | `/v1/domains/{id}/verify` | L1 — §9.6a |
+| `GET` | `/v1/domains/{domain}/mailboxes` | L2 — already promised by §10.2 |
+| `DELETE` | `/v1/domains/{id}` | L2 |
+| `DELETE` | `/v1/mailboxes/{id}` | L2 — already promised by §10.2 |
+| `POST` | `/v1/mailboxes/{id}/password` | L2 — reset, returns the new temporary password once |
+
+**What is deliberately not built, and why.**
+
+- **No `POST /v1/resellers`, and no admin console.** Creating a tenant is the one act
+  with no automated authorization story — there is nobody to authenticate as except a
+  platform administrator, and inventing a third credential tier to replace one operator
+  command is a bad trade. B2B mail platforms genuinely onboard tenants by hand, because
+  a contract and a billing relationship exist before the account does. The CLI is the
+  admin product; the reseller API is the customer product. **This is a decision, not an
+  oversight** — which is precisely what it was until this section was written.
+- **No "add mailboxes to a domain" endpoint.** `POST /v1/orders` already reuses a domain
+  the reseller owns (§9.6), so a second endpoint would be a second way to do one thing.
+- **No shared-mailbox member management, no forwarding rules.** Both tables stay inert
+  for the reasons in §9.2; forwarding additionally needs an outbound SMTP client that
+  §4 rules out of v1.
+
+**Why L2 comes after K and L1 comes before it.** L1 changes what the system accepts at
+the SMTP boundary, so it must be discovered on a laptop rather than on a live MX. L2 adds
+missing features; a deployed system with no delete endpoint is incomplete, not unsafe.
+
+---
+
 ## 10. API surface and auth
 
 ### 10.1 Two callers, two auth schemes
@@ -1027,8 +1225,18 @@ All under `/v1`. Mailbox JWT unless marked **[reseller]**.
 | `GET` | `/quota` | `{logical_bytes, physical_bytes, quota_bytes}` — the demo. Exact definitions in §11.1; `physical_bytes` must not be summed across mailboxes |
 | `POST` | `/orders` **[reseller]** | Provision, needs `Idempotency-Key` (9.6) |
 | `GET` | `/orders/{id}` **[reseller]** | Order status |
-| `GET` | `/domains/{domain}/mailboxes` **[reseller]** | List what exists |
-| `DELETE` | `/mailboxes/{id}` **[reseller]** | Deprovision |
+| `GET` | `/domains` **[reseller]** | **NOT BUILT — block L1.** List owned domains with `verified` and the challenge token (§9.6a) |
+| `POST` | `/domains/{id}/verify` **[reseller]** | **NOT BUILT — block L1.** Check the TXT record, flip `verified`, publish addresses (§9.6a) |
+| `GET` | `/domains/{domain}/mailboxes` **[reseller]** | **NOT BUILT — block L2.** List what exists |
+| `DELETE` | `/domains/{id}` **[reseller]** | **NOT BUILT — block L2.** Cascades to mailboxes and mail (§9.8) |
+| `DELETE` | `/mailboxes/{id}` **[reseller]** | **NOT BUILT — block L2.** Deprovision |
+| `POST` | `/mailboxes/{id}/password` **[reseller]** | **NOT BUILT — block L2.** Reset; returns the new temporary password once |
+
+**Twelve of these are built, six are not.** The two `NOT BUILT` rows carrying no block
+label until now — `GET /domains/{domain}/mailboxes` and `DELETE /mailboxes/{id}` — were
+listed here as though they existed. They never did. §9.8 explains what the management
+surface is and is not, and why the missing pieces were a scope decision that had simply
+never been written down as one.
 
 Deliberately absent: anything that sends mail. See §4.
 
@@ -1437,7 +1645,13 @@ wait for.
 | **H** | ~~Snooze — Redis sorted set + Go worker~~ **DONE, and it is none of those things.** Snooze is the predicate `snooze_until > now()`, evaluated at read time. Migration `c81f4e6a29d3` drops `is_snoozed`; `PATCH` gains `snooze_until`; the list gains `?snoozed=`. No Redis, no worker, no poll, no lock, no leader election. Verified: a message snoozed for 3 seconds returned by itself with nothing running. | D | medium |
 | **I** | ~~React UI + savings dashboard~~ **DONE** — Vite + React 19 + TypeScript, 5 runtime dependencies, 6 screens. Sender HTML renders in a sandboxed iframe with a prepended CSP; verified against crafted hostile mail that every vector is blocked by the browser. Storage screen shows logical vs physical with both §11.1 caveats. No compose, anywhere. | E F G H | medium |
 | **J** | ~~Load test — 100k messages, measure everything in §13~~ **DONE** — `scripts/loadtest.py`: a seeded corpus generator, a paced SMTP driver and a measurement pass, in one operator script with no new dependencies. It measures the **two** §13 numbers that were unproven; the other four were settled by the blocks that built them, so "everything in §13" was never this script's job. Standard run is **10,000** messages, not 100k — §13.3 says why. Verified: 68.8% dedup, 500 msg/min held, all 11 integrity checks passing (§13.4). | D | medium |
-| **K** | AWS deploy, README, architecture diagram | J | low |
+| **L1** | **Domain ownership verification** — derived TXT challenge, `GET /v1/domains`, `POST /v1/domains/{id}/verify`, `verified` filter in the address cache, grandfathering migration. Closes the one inert column that is a security control rather than a missing feature. §9.6a | J | medium |
+| **K** | AWS deploy, README, architecture diagram | J, L1 | low |
+| **L2** | **Management surface** — the four remaining reseller endpoints (list mailboxes, delete domain, delete mailbox, reset password) over the cascade and trigger that already exist. Finishes what §10.2 already claimed. §9.8 | K | low |
+
+**Why L1 sits between J and K.** It changes what the receiver accepts, and a change to
+mail acceptance should be discovered on a laptop, not on an internet-facing MX. L2 is
+missing features rather than a hole, so it can follow the deploy.
 
 **Critical path:** A → B → C → D. Everything interesting hangs off D, so get there first.
 After D, F, G, H and J are independent of each other.

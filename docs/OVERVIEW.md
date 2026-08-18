@@ -1,8 +1,8 @@
 # Nimbus — How It Works
 
-**Version:** 1.2
+**Version:** 1.3
 **Author:** Sujal Kumar Singh
-**Last updated:** 2026-08-18
+**Last updated:** 2026-08-19
 
 This is the plain-English version. Read this to understand the system.
 
@@ -127,6 +127,46 @@ This matters as much as the goals. It stops the project growing forever.
 **Why receive-only?** Because dedup only helps when you *store*. When you send a
 25 MB file to 40 people, SMTP makes you transmit all 1000 MB anyway. There is no
 trick for that. Storage is where the saving is real, so that is where we work.
+
+### 5.1 There is no admin screen, and that is on purpose
+
+Nimbus has three kinds of user, and only the last one has a screen:
+
+| Who | What they do | How they do it |
+|---|---|---|
+| **Us** | Create a customer organization | Run a script on the server |
+| **The organization** | Create their domain and their staff's mailboxes | Call the API with their key |
+| **A person** | Read their mail | The web app |
+
+So signing up a new customer needs somebody with access to the server. That sounds
+like a missing feature and mostly it is not one. Business email is sold, not
+self-served — there is a contract and an invoice before there is an account, so
+Mailgun and Postmark make you talk to a salesperson too. **The API is the customer
+product; the script is the admin product.** What was genuinely wrong is that this
+was never written down as a decision, so it read as an oversight. Now it is written
+down. (`HLD.md` §9.8.)
+
+What *is* missing and is being built: the organization can create things but can
+never remove them. No delete-a-mailbox, no delete-a-domain. In a system whose whole
+point is reclaiming storage, the operation that releases storage has no button. The
+database already handles it correctly — only the API is absent. That is block L2.
+
+### 5.2 We never checked that a domain belongs to the customer
+
+Anyone with a valid API key could claim `google.com`, because we only ever checked
+that no one else had claimed it first. There is a column in the database called
+`verified` that was supposed to prevent exactly this. Nothing has ever set it.
+
+Right now that is contained — API keys are handed out by us, one at a time. It stops
+being contained the moment the system is on the real internet with a real address,
+because then "claimed a domain it does not own" means "is accepting somebody else's
+mail". So it gets fixed before the deploy, not after.
+
+**The fix is the standard one.** We give the customer a random-looking string. They
+have to put it into their domain's DNS settings — which only the real owner can do.
+We look it up. If it matches, the domain is verified and its addresses go live. If
+not, mail to that domain keeps bouncing. Google Workspace and Let's Encrypt prove
+ownership the same way. (`HLD.md` §9.6a.)
 
 ---
 

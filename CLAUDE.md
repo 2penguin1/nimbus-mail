@@ -150,7 +150,8 @@ collisions. An exception aborts the whole transaction and ties the code to how
 SQLAlchemy happens to wrap asyncpg's error types.
 
 Build order is `docs/HLD.md` §15. Built so far: blocks **A**, **B**, **C**, **D**, **E**,
-**F**, **G**, **H**, **I** and **J**. Next: **K** (deploy).
+**F**, **G**, **H**, **I** and **J**. Next: **L1** (domain verification), then **K**
+(deploy), then **L2** (management endpoints). L1 moved ahead of K deliberately — HLD §15.
 
 **Layout rules.** `src/nimbus/` is an installed package, so there is exactly one way to
 import anything: `from nimbus.models import Blob`. No `sys.path` juggling, no relative
@@ -744,8 +745,72 @@ cryptographically valid. #1 and #5 have offline checks (`go build`/`go test`,
 32-byte HS256 floor (RFC 7518 §3.2), which PyJWT warns about on every call. A guessable
 signing key forges a token for any mailbox in any tenant. `config.py` now refuses to
 start below 32 bytes; HLD §14 lists the secrets a deploy must set.
-- Critical path is A → B → C → D. Everything else hangs off D. **A–J are done; only K
-  (AWS deploy) remains.**
+- Critical path is A → B → C → D. Everything else hangs off D. **A–J are done. Remaining:
+  L1 → K → L2.**
+- **Blocks L1 and L2 are DESIGNED, not built — HLD §9.6a and §9.8, ARCHITECTURE diagram 22.**
+  Written up 2026-08-19 after Sujal asked how an organization gets created. Waiting on his
+  signal to start; do not begin either without it.
+
+  **What the question exposed — three things, and only one is a defect:**
+
+  1. **`domain.verified` is a security control that does not exist.** The column has been
+     in the schema since the initial migration and nothing has ever written or read it, so
+     `domain.name` is first-come-wins: any tenant with a valid API key can claim
+     `google.com`. Worse than a missing feature, because a reader sees the column and
+     assumes a check. **This is the defect.** Blast radius today is limited to tenants we
+     onboarded by hand — but block K puts it behind a real MX, where it stops being a wrong
+     row and becomes a mail server accepting somebody else's mail. Hence L1 before K.
+  2. **The whole platform is create-only.** No list, no update, no delete at any tier above
+     one message. An employee leaves and there is no way to remove their mailbox except raw
+     SQL. In a system whose value is refcounted storage, the operation that RELEASES storage
+     has no API. Not a defect — a scope decision that had never been written down as one,
+     which is exactly how it read as an oversight.
+  3. **§10.2 already promised two of the missing endpoints.** `GET /domains/{domain}/mailboxes`
+     and `DELETE /mailboxes/{id}` were listed as part of the API surface; the router
+     directory has 12 endpoints, not 14. Now marked NOT BUILT with their block, rather than
+     quietly deleted — an over-claiming doc is the thing this project exists to avoid.
+
+  **Three design decisions worth not re-litigating:**
+
+  - **Enforcement for L1 is free, and that is why the design is small.** `addresses.py`
+    already joins `Mailbox → Domain` and `Alias → Domain` to build the Redis set the
+    receiver answers `RCPT TO` from. Verification is three `.where(Domain.verified)`
+    clauses plus one guard in `orders.py`. **The Go receiver does not change at all** — an
+    unverified domain's addresses are simply absent, so it already answers `550`. Resist
+    any design that adds a second check at the SMTP boundary; a second source of truth for
+    "may this address receive" is how the two sides drift.
+  - **The challenge token is derived, never stored:**
+    `base32(HMAC-SHA256(JWT_SECRET, b"nimbus-domain-verify:" + domain_id))`. No column, no
+    migration, no expiry, stable across restarts. The prefix is domain separation so it can
+    never collide with a session token signed by the same secret. Trade-off taken: it cannot
+    be rotated without rotating `JWT_SECRET`, which is fine because a leaked challenge is
+    useless without write access to the DNS zone.
+  - **No `POST /v1/resellers` and no admin console, deliberately.** Creating a tenant is the
+    one act with no automated authorization story — there is nobody to authenticate as but a
+    platform admin, and inventing a third credential tier to replace one operator command is
+    a bad trade. The CLI is the admin product, the reseller API is the customer product.
+
+  **Two traps waiting in the implementation:**
+
+  1. **Grandfathering is mandatory.** Every existing `domain` row is `verified = false`.
+     Shipping the filter without `UPDATE domain SET verified = true` in the same migration
+     empties `valid_addresses` and the system silently stops accepting ALL mail.
+  2. **Deleting an organization is not a cascade and cannot be made one.** `blob`, `chunk`
+     and `message` reference `reseller` with `RESTRICT`, so it is staged: delete the domains
+     (cascade drives every refcount to 0) → run `nimbus.gc` → then delete the reseller row.
+     Skipping the middle step aborts loudly on the FK. **That is the constraint working.**
+     Do not loosen it to make the endpoint tidier — a noisy abort is the good failure mode,
+     orphaned bytes are the bad one.
+
+  **The good news L2 inherits:** the database already does deprovisioning. The cascade chain
+  `reseller → domain → mailbox → mailbox_message` plus the row-level trigger was built for
+  this — the initial migration names "a mailbox is deprovisioned" and "a domain is deleted"
+  as paths 2 and 3, and block A proved all three live (3→2→1→0). L2 is HTTP over machinery
+  that already works; it must not touch the storage engine.
+
+  **New dependency L1 needs:** `dnspython` — Python has no stdlib TXT lookup (`socket`
+  resolves names to addresses only), and DNS is a binary protocol over UDP with
+  truncation-and-retry-over-TCP. Code rule 3 forbids hand-writing it.
 - **Block K inherits an unsettled sizing question from J.** The load test measured a
   laptop, and every figure it produced is a floor. §14 puts the API, worker, receiver AND
   a self-hosted Redpanda on one `t3.small` — 2 GiB total — against a worker that peaks at
@@ -755,5 +820,6 @@ start below 32 bytes; HLD §14 lists the secrets a deploy must set.
 - **Outstanding on Sujal:** file the AWS port 25 unblock request. Takes AWS several days;
   nothing else can make it faster. Only needed if the deployed system must receive real mail.
 - Open decisions still unsettled: `docs/HLD.md` §16
-- **Loose end:** `docs/HLD.md` §7 lists a `mail.processed` Kafka topic that nothing
-  publishes or consumes. Either give it a purpose or delete it.
+- **Kafka carries exactly one topic: `mail.received`, 4 partitions.** The `mail.processed`
+  loose end is closed — it is gone from §7, and this line replaced the note chasing it.
+  A second topic would need a consumer that does not exist; do not add one speculatively.
