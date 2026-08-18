@@ -1,6 +1,6 @@
 # Nimbus — High Level Design
 
-**Version:** 1.6 (living document — expect this to change as we build)
+**Version:** 1.7 (living document — expect this to change as we build)
 **Author:** Sujal Kumar Singh
 **Last updated:** 2026-08-19
 
@@ -550,8 +550,10 @@ same way `forwarding_rule` is. Recorded so the docs do not describe it as workin
 defaults to `false`, and nothing has ever written or read it — so domain ownership is
 unchecked and `domain.name` is first-come-wins. Unlike the two above, this is a security
 control that looks present and is not, which is worse than an absent feature: a reader
-sees the column and assumes a check exists. **Block L1 closes it** — see §9.6a for the
-design and why it lands before the deploy.
+sees the column and assumes a check exists. **Block L1 closed it** — see §9.6a. Note
+what it did NOT close: a squatter still HOLDS the name for ever, because `domain.name`
+is globally unique and nothing reclaims it. L1 stops them receiving mail, which is the
+half that matters for mail safety.
 
 **Every resolved mailbox is re-checked against the reseller before delivery.**
 `alias.target_mailbox_id` and `domain.catch_all_mailbox_id` are plain foreign keys to
@@ -809,7 +811,7 @@ created twice", not "secrets are repeatable".
 - Swapped atomically (build a temp key, `RENAME` over the live one). A plain
   delete-then-fill leaves a window where the set is empty and every message is rejected.
 
-### 9.6a Domain ownership verification (planned — block L1, lands BEFORE the deploy)
+### 9.6a Domain ownership verification (**built and verified — block L1**)
 
 **The hole.** `domain.verified` has sat in the schema since the initial migration (§8).
 Nothing has ever set it and nothing has ever read it. `domain.name` carries a global
@@ -857,6 +859,16 @@ signed by the same secret. **Trade-off:** the token cannot be rotated without ro
 `JWT_SECRET`. Accepted, because a leaked challenge proves nothing on its own — using it
 still requires write access to the DNS zone.
 
+**"Never stored" is literal, and it took a correction to keep it that way.** The first
+version put the challenge into the `POST /v1/orders` response body — which is frozen
+into `provision_order.result`, a JSON column that is also POSTed to the reseller's
+`webhook_url`. That wrote a credential into a row and shipped it to a third party, and
+the stored copy would have gone stale on a `JWT_SECRET` rotation while the endpoint
+stayed current. The order response now carries only the *current* `verified` flag and a
+pointer to `GET /v1/domains`, both computed fresh on the way out — for the first response
+and every replay alike. Replaying a months-old order must not resurrect months-old advice
+telling a reseller to publish a record they published weeks ago.
+
 **Enforcement is free, and that is the whole reason this design stays small.**
 `api/addresses.py` already joins `Mailbox → Domain` and `Alias → Domain` to build the
 Redis set the receiver answers `RCPT TO` from. Verification becomes three `.where()`
@@ -864,7 +876,8 @@ clauses on those existing joins plus one guard in `orders.py`:
 
 | Place | Change |
 |---|---|
-| `addresses.refresh()` | `.where(Domain.verified)` on both address selects and on `catch_alls` |
+| `addresses._address_query()` | `.where(Domain.verified)` — **one query**, which both the startup rebuild and the per-domain publish are built from, so a second call site cannot forget the filter |
+| `addresses.publish_domain()` | new — publishes one domain's addresses the moment it passes, without a full rebuild |
 | `orders.py` | call `addresses.add()` only for a verified domain |
 | `smtp-receiver/` | **nothing** |
 
@@ -877,8 +890,9 @@ for free.
 
 | Question | Answer |
 |---|---|
-| Second time? | Idempotent. Re-verifying an already-verified domain re-reads DNS, matches, and returns the same `200`. |
+| Second time? | Idempotent, and it **does not re-read DNS**. A resolver blip must never be able to un-verify a live domain, so nothing in this endpoint ever sets `verified` back to false. It *does* re-publish the addresses — see the row below. |
 | Crashes halfway? | `verified = true` commits before the Redis write, same ordering as §9.6. A lost cache write is healed by the next API startup rebuild. |
+| Crashes **between** the commit and the publish? | The domain is verified in Postgres and absent from Redis — every message `550`'d. So `publish_domain()` runs on **every** call, including the already-verified path. An early return there would answer `200` and publish nothing, making `verify` useless as the repair tool it is the natural one to reach for. Found in review; it was the bug. |
 | At 100x? | DNS lookups are operator-initiated, one per `verify` call, never per message. Per-message cost is unchanged — it is still one Redis `SISMEMBER` that already happens. |
 
 **What this deliberately does not do.**
@@ -891,15 +905,49 @@ for free.
   the same bar Google Workspace, AWS SES and Let's Encrypt set, and it is the strongest
   claim DNS can support.
 - **No SPF/DMARC checking.** Still §16's open question, unchanged by this.
+- **It does not stop a squatter HOLDING the name.** `domain.name` is globally `UNIQUE`,
+  so a tenant can claim `google.com`, never verify it, and the rightful owner gets a
+  permanent `409 domain not available` — no expiry, no reclaim, and no delete endpoint
+  until L2. L1 closes the half that matters for mail safety: a squatter cannot
+  **receive**. It does not close the half about who holds the string. Reclaiming
+  unverified domains after N days is real work and is not in this block.
+- **The DNS path has no integration test, and cannot have one offline.** Every
+  integration test provisions a `.example` domain — RFC 2606 reserved, no zone, no
+  nameserver — so `verify` can never pass for them. They call a fixture that sets the
+  flag directly (`tests/integration/conftest.py`), the same escape hatch
+  `scripts/verify_domain.py` gives an operator. `_lookup_txt` and the 404/409/503 mapping
+  are covered only by `tests/unit/test_domain_challenge.py`, which never touches a
+  resolver, plus one manual live run against `example.com` recorded below.
 
-**The migration trap — read this before writing the code.** Every existing `domain` row
-has `verified = false`. Turning enforcement on without a data migration removes every
-current address from `valid_addresses` and the system silently stops accepting all mail.
-The migration must grandfather what already exists:
+**The migration trap.** Every existing `domain` row has `verified = false`. Turning
+enforcement on without a data migration removes every current address from
+`valid_addresses` and the system silently stops accepting all mail. Migration
+`e5b71c04d9a3` grandfathers what already exists:
 
 ```sql
 UPDATE domain SET verified = true;   -- everything provisioned before enforcement existed
 ```
+
+Verified on the live database: 5 domains, all `false`, all `true` after — exactly the
+outage the migration prevents.
+
+**⚠️ Deploy ordering is part of the feature, not an operational detail.** Migrate FIRST,
+then start the new code. Inverted, the API boots against a database where every domain
+is `false`, publishes zero addresses, and `_swap_set` deletes both Redis keys — every
+`RCPT TO` gets `550`. Running the migration afterwards **does not heal it**, because
+`refresh()` is called from exactly one place in production (the lifespan). The API must
+be restarted a second time.
+
+Nothing about that failure is loud on its own: no error, no non-zero exit, and the
+receiver behaving exactly as designed. So `refresh()` now logs an ERROR naming this
+migration when it publishes zero addresses while mailboxes exist. Block K's runbook must
+carry the ordering; a rolling deploy will happily interleave the two steps.
+
+**What grandfathering costs, stated rather than assumed.** The `UPDATE` is
+unconditional, so if a squatted domain were already in the table it would be marked
+verified for ever — there is no un-verify path anywhere in the code. That is safe here
+only because the only databases are a laptop and a not-yet-deployed stack. **On a
+deployed system this migration needs a manual review of the `domain` table first.**
 
 **New dependency.**
 
@@ -908,9 +956,33 @@ UPDATE domain SET verified = true;   -- everything provisioned before enforcemen
 | `dnspython` | Python has no stdlib TXT lookup — `socket` resolves names to addresses only. DNS is a binary protocol over UDP with truncation-and-retry-over-TCP; hand-writing a resolver is exactly what code rule 3 forbids. |
 
 `verify` must distinguish its failures, because DNS propagation means the first attempt
-routinely fails on a correctly configured domain: `NXDOMAIN`/no TXT → "record not found
-yet, retry"; TXT present but wrong → "value does not match"; resolver timeout → `503`,
-not a verification failure.
+routinely fails on a correctly configured domain: `NXDOMAIN`/no TXT → `404` "not found
+yet, retry"; TXT present but wrong → `409` "value does not match"; resolver problem →
+`503`, not a verification failure. **Every other `dns.exception.DNSException` also maps
+to 503** rather than escaping as a 500 — `NameTooLong` is reachable (the order validator
+caps each label at 63 characters but not the total, so a 250-character domain registers
+fine and `_nimbus-challenge.` pushes it past 255), and `NoResolverConfiguration` fires in
+a container with no usable `resolv.conf`, which is block K's problem exactly.
+
+**Verified live, 2026-08-19.** Against the running stack, with one real DNS lookup that
+left the machine:
+
+| # | Check | Result |
+|---|---|---|
+| 1 | Order a domain → `verified: false` + `next_step` | `201` |
+| 2 | Its address in Redis before verification | **absent** — this is the enforcement |
+| 3 | `GET /v1/domains` returns the record to publish | `_nimbus-challenge.example.com`, 52 chars |
+| 4 | `POST /verify` against real DNS, no TXT present | **`404`** — a genuine NXDOMAIN |
+| 5 | Wrong API key | `401` |
+| 6 | **Another tenant's key** | `404 No such domain` — not `403`, so it leaks nothing |
+| 7 | Operator path (`scripts/verify_domain.py`) | 1 address published |
+| 8 | Address in Redis after | **present** |
+| 9 | Re-verify | `200`, `already_verified`, **re-published anyway** |
+| 10 | Replay the original order | `verified: true`, `next_step: null` — current, not frozen |
+
+Separately, on the live database: unverifying one domain removed exactly its 2 addresses
+from `valid_addresses` and nothing else; re-verifying restored the identical set. **119
+tests pass** (110 offline, 9 integration).
 
 ### 9.7 Garbage collection
 
@@ -1225,18 +1297,18 @@ All under `/v1`. Mailbox JWT unless marked **[reseller]**.
 | `GET` | `/quota` | `{logical_bytes, physical_bytes, quota_bytes}` — the demo. Exact definitions in §11.1; `physical_bytes` must not be summed across mailboxes |
 | `POST` | `/orders` **[reseller]** | Provision, needs `Idempotency-Key` (9.6) |
 | `GET` | `/orders/{id}` **[reseller]** | Order status |
-| `GET` | `/domains` **[reseller]** | **NOT BUILT — block L1.** List owned domains with `verified` and the challenge token (§9.6a) |
-| `POST` | `/domains/{id}/verify` **[reseller]** | **NOT BUILT — block L1.** Check the TXT record, flip `verified`, publish addresses (§9.6a) |
+| `GET` | `/domains` **[reseller]** | **Built (block L1).** Owned domains with `verified` and the exact TXT record to publish (§9.6a) |
+| `POST` | `/domains/{id}/verify` **[reseller]** | **Built (block L1).** Check the TXT record, flip `verified`, publish addresses. `404` not-yet / `409` mismatch / `503` resolver (§9.6a) |
 | `GET` | `/domains/{domain}/mailboxes` **[reseller]** | **NOT BUILT — block L2.** List what exists |
 | `DELETE` | `/domains/{id}` **[reseller]** | **NOT BUILT — block L2.** Cascades to mailboxes and mail (§9.8) |
 | `DELETE` | `/mailboxes/{id}` **[reseller]** | **NOT BUILT — block L2.** Deprovision |
 | `POST` | `/mailboxes/{id}/password` **[reseller]** | **NOT BUILT — block L2.** Reset; returns the new temporary password once |
 
-**Twelve of these are built, six are not.** The two `NOT BUILT` rows carrying no block
-label until now — `GET /domains/{domain}/mailboxes` and `DELETE /mailboxes/{id}` — were
-listed here as though they existed. They never did. §9.8 explains what the management
-surface is and is not, and why the missing pieces were a scope decision that had simply
-never been written down as one.
+**Fourteen of these are built, four are not.** The four remaining are block L2, and two
+of them — `GET /domains/{domain}/mailboxes` and `DELETE /mailboxes/{id}` — were listed
+here as though they existed long before anything implemented them. They never did. §9.8
+explains what the management surface is and is not, and why the missing pieces were a
+scope decision that had simply never been written down as one.
 
 Deliberately absent: anything that sends mail. See §4.
 
@@ -1645,7 +1717,7 @@ wait for.
 | **H** | ~~Snooze — Redis sorted set + Go worker~~ **DONE, and it is none of those things.** Snooze is the predicate `snooze_until > now()`, evaluated at read time. Migration `c81f4e6a29d3` drops `is_snoozed`; `PATCH` gains `snooze_until`; the list gains `?snoozed=`. No Redis, no worker, no poll, no lock, no leader election. Verified: a message snoozed for 3 seconds returned by itself with nothing running. | D | medium |
 | **I** | ~~React UI + savings dashboard~~ **DONE** — Vite + React 19 + TypeScript, 5 runtime dependencies, 6 screens. Sender HTML renders in a sandboxed iframe with a prepended CSP; verified against crafted hostile mail that every vector is blocked by the browser. Storage screen shows logical vs physical with both §11.1 caveats. No compose, anywhere. | E F G H | medium |
 | **J** | ~~Load test — 100k messages, measure everything in §13~~ **DONE** — `scripts/loadtest.py`: a seeded corpus generator, a paced SMTP driver and a measurement pass, in one operator script with no new dependencies. It measures the **two** §13 numbers that were unproven; the other four were settled by the blocks that built them, so "everything in §13" was never this script's job. Standard run is **10,000** messages, not 100k — §13.3 says why. Verified: 68.8% dedup, 500 msg/min held, all 11 integrity checks passing (§13.4). | D | medium |
-| **L1** | **Domain ownership verification** — derived TXT challenge, `GET /v1/domains`, `POST /v1/domains/{id}/verify`, `verified` filter in the address cache, grandfathering migration. Closes the one inert column that is a security control rather than a missing feature. §9.6a | J | medium |
+| **L1** | ~~**Domain ownership verification**~~ **DONE** — derived TXT challenge, `GET /v1/domains`, `POST /v1/domains/{id}/verify`, one `verified` filter in the address cache, migration `e5b71c04d9a3` grandfathering every existing domain. The Go receiver was not touched. Reviewed by an independent SDE3 agent: 9 findings, 8 applied, 1 rejected with evidence. Verified live including a real DNS lookup — §9.6a's table of 10. **119 tests pass.** | J | medium |
 | **K** | AWS deploy, README, architecture diagram | J, L1 | low |
 | **L2** | **Management surface** — the four remaining reseller endpoints (list mailboxes, delete domain, delete mailbox, reset password) over the cascade and trigger that already exist. Finishes what §10.2 already claimed. §9.8 | K | low |
 

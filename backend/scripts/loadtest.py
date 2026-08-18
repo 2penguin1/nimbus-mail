@@ -726,6 +726,19 @@ async def provision(tag: str, mailboxes: int) -> tuple:
         )
     if resp.status_code != 201:
         raise SystemExit(f"provisioning failed: {resp.status_code} {resp.text}")
+
+    # Block L1 (HLD §9.6a). `lt-{tag}.example` is RFC 2606 reserved — no zone, no
+    # nameserver, so the real TXT check can never pass for it. Unverified means the
+    # addresses never reach Redis and all 10,000 messages below would be refused 550.
+    # Same escape hatch `scripts/verify_domain.py` gives an operator on a local stack.
+    async with db.Session() as session:
+        d = await session.scalar(select(Domain).where(Domain.name == domain))
+        d.verified = True
+        await session.commit()
+        await db.connect_redis()
+        published = await addresses.publish_domain(session, d.id)
+    print(f"verified {domain} ({published} addresses live)")
+
     return rid, domain
 
 

@@ -63,7 +63,7 @@ async def wait_for(session, reseller_id, want, seconds=90):
     return got
 
 
-async def test_one_message_in_two_of_my_mailboxes() -> None:
+async def test_one_message_in_two_of_my_mailboxes(verify_domain) -> None:
     async with db.Session() as session:
         key, key_hash = security.new_api_key()
         session.add(Reseller(name=f"dup-{TAG}", api_key_hash=key_hash))
@@ -79,6 +79,11 @@ async def test_one_message_in_two_of_my_mailboxes() -> None:
                     headers={"Authorization": f"Bearer {key}", "Idempotency-Key": TAG},
                 )
                 assert order.status_code == 201, order.text
+
+                # Block L1 (HLD §9.6a): a `.example` domain has no DNS zone, so it can never pass
+                # the real TXT check — and unverified means its addresses never reach Redis and
+                # every send below would get 550. See tests/integration/conftest.py.
+                await verify_domain(session, DOMAIN)
                 passwords = {
                     m["local_part"]: m["temp_password"] for m in order.json()["mailboxes"]
                 }

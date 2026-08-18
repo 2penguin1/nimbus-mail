@@ -93,6 +93,8 @@ backend/
         messages.py  list, read, patch, delete, streaming attachment download
         threads.py   GET /v1/threads/{id}
         search.py    GET /v1/search
+        domains.py   block L1: GET /v1/domains, POST /v1/domains/{id}/verify.
+                     The ONLY module that reads DNS
         quota.py     GET /v1/quota — the ONE read endpoint that must not
                      filter on visibility.readable_mailboxes(). See its docstring
     worker/
@@ -104,8 +106,15 @@ backend/
   tests/
     unit/            no database, no network. Run them anywhere.
     integration/     marked `integration`, need the live stack
+      conftest.py    ONE fixture, `verify_domain` — see block L1 below for why
+                     every one of these tests needs it
   scripts/           one-off operator tools (create_reseller.py,
                      apply_raw_retention.py)
+    verify_domain.py block L1. Marks a domain verified WITHOUT the DNS check.
+                     A `.example` domain has no zone, so the local stack and
+                     every integration test would otherwise go dark. Not an
+                     endpoint on purpose: it bypasses the only ownership proof
+                     we have, so it costs a shell on the box
     loadtest.py      block J. Seeded corpus + paced SMTP driver + measurement,
                      one file. NOT in tests/integration/ on purpose: a 20-minute
                      6 GB measurement must never join the default pytest run
@@ -195,6 +204,7 @@ uv run pytest -q -s tests/integration                # -s to see the dedup numbe
 |---|---|
 | `aiokafka[snappy]` | The worker's Kafka consumer. **The `[snappy]` extra is not optional** — franz-go compresses batches with snappy by default, so without the codec the consumer starts fine and dies on the first real message. |
 | `boto3` | S3 and MinIO with one client (HLD §14). Blocking, so calls go through stdlib `asyncio.to_thread` rather than adding `aioboto3`. |
+| `dnspython` (block L1) | Reading the TXT record that proves a reseller controls a domain. Python has **no stdlib TXT lookup** — `socket` resolves names to addresses and nothing else. DNS is a binary protocol over UDP that truncates and retries over TCP; hand-writing it is what code rule 3 forbids. Async-native, so it matches the API. |
 
 **Settings live in `backend/.env`, never in code.** `nimbus/config.py` is a
 `pydantic-settings` model with **no working defaults** — a missing value or a
@@ -745,9 +755,76 @@ cryptographically valid. #1 and #5 have offline checks (`go build`/`go test`,
 32-byte HS256 floor (RFC 7518 §3.2), which PyJWT warns about on every call. A guessable
 signing key forges a token for any mailbox in any tenant. `config.py` now refuses to
 start below 32 bytes; HLD §14 lists the secrets a deploy must set.
-- Critical path is A → B → C → D. Everything else hangs off D. **A–J are done. Remaining:
-  L1 → K → L2.**
-- **Blocks L1 and L2 are DESIGNED, not built — HLD §9.6a and §9.8, ARCHITECTURE diagram 22.**
+- Critical path is A → B → C → D. Everything else hangs off D. **A–J and L1 are done.
+  Remaining: K (deploy), then L2.**
+- **Block L1 DONE and verified live.** Domain ownership verification. `api/routers/domains.py`
+  — `GET /v1/domains`, `POST /v1/domains/{id}/verify`. Migration `e5b71c04d9a3`. The Go
+  receiver was **not touched**. **119 tests pass** (110 offline, 9 integration). Reviewed by
+  an independent SDE3 agent that loaded its skills first: 9 findings, 8 applied, 1 rejected
+  with evidence. Verified live, including one real DNS lookup that left the machine —
+  HLD §9.6a's table of 10 checks.
+
+  **Five rules block L1 establishes:**
+
+  1. **Enforcement lives in ONE query, and that is the whole design.** `addresses._address_query()`
+     carries the `.where(Domain.verified)` and both the startup rebuild and the per-domain
+     publish are built from it. An unverified domain's addresses never reach Redis, so the Go
+     receiver answers `550` through the path it already had. **Never add a second check at the
+     SMTP boundary** — a second source of truth for "may this address receive" is how the two
+     sides drift apart. Confirmed by the reviewer: the receiver reads only `valid_addresses`
+     and `catch_all_domains`, with no domain-level bypass.
+  2. **A migration that prevents an outage owns the deploy order too.** Migrate FIRST, then
+     start the new code. Inverted, the API publishes zero addresses, `_swap_set` DELETEs both
+     keys, and every `RCPT TO` gets `550` — and running the migration afterwards does NOT heal
+     it, because `refresh()` is called from exactly one place in production (the lifespan). It
+     needs a second restart. Nothing about that is loud, so `refresh()` now logs an ERROR
+     naming the migration when it publishes zero addresses while mailboxes exist.
+  3. **`hmac.compare_digest` RAISES on non-ASCII `str`.** It does not return False — it raises
+     `TypeError`. A smart quote in a pasted token, or U+FFFD from decoding an unrelated TXT
+     record, turned `POST /verify` into a 500, *intermittently*, because `any()` short-circuits
+     so the outcome depended on the order DNS returned the records in. Fixed at the one choke
+     point every value passes through — the same shape as the `\x00` bug in `search_query.parse()`.
+     **And the first fix was wrong:** stripping the bad bytes also avoids the 500 but makes
+     `X<junk>Y` verify against `XY`, so a corrupted DNS record passes silently. It fails closed
+     now. Forgiving what DNS panels *do* to a value (`.strip()`, `.upper()`) is fine; dropping
+     characters is not.
+  4. **A commit and the cache write after it are two failures, so the retry path must repair.**
+     `verify` commits `verified = true` and then publishes to Redis. If the publish fails, the
+     obvious retry hit an `already_verified` early return that answered `200` and published
+     NOTHING — verified in Postgres, absent from Redis, every message `550`'d, with a green
+     response saying it worked. `publish_domain()` now runs on **every** call. Any endpoint that
+     commits then writes a cache needs the same shape.
+  5. **Storing a derived value throws away the reason it was derived.** The challenge was
+     briefly written into the order response, which is frozen into `provision_order.result` —
+     a JSON column that is also POSTed to the reseller's `webhook_url`. That put a credential
+     in a row, shipped it to a third party, and would have gone stale on a `JWT_SECRET`
+     rotation while the endpoint stayed current. Order responses now carry only the *current*
+     flag plus a pointer to `GET /v1/domains`, computed fresh on first response and every
+     replay. **A replay must reflect the state now, not the state then.**
+
+  **One reviewer finding rejected, with the reason:** it called the post-`COMMIT` re-read of
+  `Domain.verified` in `orders.py` a redundant round trip already answered by `_provision`'s
+  earlier read. It is not. An order can read `verified = false`, a concurrent verify can commit
+  and publish (seeing none of the order's uncommitted mailboxes), and the order then commits —
+  leaving those mailboxes verified in Postgres and absent from Redis until the next restart.
+  The re-read closes it. The independent reviewer caught this and disagreed with its own
+  sub-agent; the sub-agent was wrong.
+
+  **What L1 deliberately did NOT fix:** a squatter still HOLDS the name for ever. `domain.name`
+  is globally unique, nothing reclaims an unverified domain, and there is no delete until L2.
+  L1 closes the half that matters for mail safety — a squatter cannot receive.
+
+  **The DNS path has no integration test and cannot have one offline.** Every integration test
+  provisions a `.example` domain (RFC 2606 reserved — no zone, ever), so `verify` can never
+  pass for them. They call the `verify_domain` fixture in `tests/integration/conftest.py`, the
+  same escape hatch `scripts/verify_domain.py` gives an operator. `_lookup_txt` and the
+  404/409/503 mapping are covered by unit tests plus one manual live run against `example.com`.
+
+  **There is deliberately no config flag to disable verification.** A security control with an
+  off switch is one wrong env var from being off in production, which is the exact failure L1
+  exists to prevent. The escape hatch is per-domain, named, and costs a shell on the box.
+
+- **Block L2 is DESIGNED, not built — HLD §9.8, ARCHITECTURE diagram 22.**
   Written up 2026-08-19 after Sujal asked how an organization gets created. Waiting on his
   signal to start; do not begin either without it.
 

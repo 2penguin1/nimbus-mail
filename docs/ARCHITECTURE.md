@@ -1,6 +1,6 @@
 # Nimbus — Architecture in Diagrams
 
-**Version:** 1.7
+**Version:** 1.8
 **Author:** Sujal Kumar Singh
 **Last updated:** 2026-08-19
 
@@ -37,7 +37,7 @@ what it shows and a few points that matter.
 | 19 | Provisioning without double-creating |
 | 20 | Build order |
 | 21 | The load test: which bytes each ratio divides |
-| 22 | Who can do what — the three tiers, and the domain check (**planned**) |
+| 22 | Who can do what — the three tiers, and the domain check |
 
 ---
 
@@ -1082,9 +1082,8 @@ over deleting it in GC, and R3' is what the store looks like once that rule fire
 
 ## 22. Who can do what — the three tiers, and the domain check
 
-**Everything marked `L1`/`L2` is PLANNED, not built.** HLD §9.6a and §9.8 are the design.
-Drawn now because the gap it shows is real today: only the bottom tier has a UI, and the
-domain check does not exist at all.
+**`L1` is BUILT (HLD §9.6a). `L2` is still planned (§9.8).** The three-tier gap the top
+diagram shows is real today: only the bottom tier has a UI.
 
 ```
   TIER              CREATED BY                       SURFACE TODAY
@@ -1118,7 +1117,7 @@ Where the domain check inserts itself, and why the receiver needs no change:
         │
         │   reseller publishes TXT _nimbus-challenge.acme.com
         ▼
-   POST /v1/domains/{id}/verify          L1
+   POST /v1/domains/{id}/verify          L1  -- BUILT
         │
         ├─ resolve TXT ─── no record ──► 404 "not found yet, DNS may be propagating"
         ├─              ── mismatch  ──► 409 "value does not match"
@@ -1134,11 +1133,12 @@ Where the domain check inserts itself, and why the receiver needs no change:
 
 | Piece | Changes for L1 |
 |---|---|
-| `api/addresses.py` | three `.where(Domain.verified)` clauses on joins that already exist |
+| `api/addresses.py` | `.where(Domain.verified)` in `_address_query()` — ONE query, so a second call site cannot forget it |
 | `api/routers/orders.py` | publish addresses only for a verified domain |
 | `api/routers/domains.py` | **new** — list + verify |
-| migration | grandfather every existing row to `verified = true` |
-| `smtp-receiver/` | **nothing** |
+| `scripts/verify_domain.py` | **new** — operator escape hatch; a `.example` domain has no zone and can never pass |
+| migration `e5b71c04d9a3` | grandfather every existing row to `verified = true` |
+| `smtp-receiver/` | **nothing** — confirmed, it reads only the two Redis keys |
 
 Deprovisioning, which L2 exposes and the database already does:
 

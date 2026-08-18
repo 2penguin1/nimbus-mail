@@ -23,7 +23,16 @@ from fastapi import FastAPI
 
 from nimbus import db
 from nimbus.api import addresses
-from nimbus.api.routers import auth, health, messages, orders, quota, search, threads
+from nimbus.api.routers import (
+    auth,
+    domains,
+    health,
+    messages,
+    orders,
+    quota,
+    search,
+    threads,
+)
 
 log = logging.getLogger("nimbus.api")
 
@@ -47,6 +56,7 @@ app = FastAPI(title="Nimbus", version="0.1.0", lifespan=lifespan)
 app.include_router(health.router)
 app.include_router(auth.router)
 app.include_router(orders.router)
+app.include_router(domains.router)
 app.include_router(messages.router)
 app.include_router(threads.router)
 app.include_router(search.router)

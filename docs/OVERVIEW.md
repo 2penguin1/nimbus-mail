@@ -1,6 +1,6 @@
 # Nimbus — How It Works
 
-**Version:** 1.3
+**Version:** 1.4
 **Author:** Sujal Kumar Singh
 **Last updated:** 2026-08-19
 
@@ -151,7 +151,7 @@ never remove them. No delete-a-mailbox, no delete-a-domain. In a system whose wh
 point is reclaiming storage, the operation that releases storage has no button. The
 database already handles it correctly — only the API is absent. That is block L2.
 
-### 5.2 We never checked that a domain belongs to the customer
+### 5.2 We never checked that a domain belongs to the customer — now we do
 
 Anyone with a valid API key could claim `google.com`, because we only ever checked
 that no one else had claimed it first. There is a column in the database called
@@ -162,11 +162,19 @@ being contained the moment the system is on the real internet with a real addres
 because then "claimed a domain it does not own" means "is accepting somebody else's
 mail". So it gets fixed before the deploy, not after.
 
-**The fix is the standard one.** We give the customer a random-looking string. They
-have to put it into their domain's DNS settings — which only the real owner can do.
-We look it up. If it matches, the domain is verified and its addresses go live. If
-not, mail to that domain keeps bouncing. Google Workspace and Let's Encrypt prove
-ownership the same way. (`HLD.md` §9.6a.)
+**The fix is the standard one, and it is now built.** We give the customer a
+random-looking string. They put it into their domain's DNS settings — which only the
+real owner can do. We look it up. If it matches, the domain is verified and its
+addresses go live. If not, mail to that domain keeps bouncing. Google Workspace and
+Let's Encrypt prove ownership the same way. (`HLD.md` §9.6a.)
+
+**The neat part:** the mail server itself did not change by one line. It already
+refuses any address it cannot find in its list. Verification just decides what goes
+into that list. One filter, in one query.
+
+**What it still does not fix:** a squatter can keep *holding* the name. They cannot
+receive any mail on it, but the real owner cannot claim it either, because nothing
+reclaims an unverified domain and there is no delete yet. That is block L2.
 
 ---
 

@@ -89,7 +89,7 @@ async def wait_for(session, reseller_id, want: int, seconds: int = 90) -> int:
     return got
 
 
-async def test_dedup_stores_one_copy() -> None:
+async def test_dedup_stores_one_copy(verify_domain) -> None:
     s3 = boto3.client(
         "s3",
         endpoint_url=settings.s3_endpoint,
@@ -113,6 +113,11 @@ async def test_dedup_stores_one_copy() -> None:
                     headers={"Authorization": f"Bearer {key}", "Idempotency-Key": TAG},
                 )
                 assert r.status_code == 201, r.text
+
+                # Block L1 (HLD §9.6a): a `.example` domain has no DNS zone, so it can never pass
+                # the real TXT check — and unverified means its addresses never reach Redis and
+                # every send below would get 550. See tests/integration/conftest.py.
+                await verify_domain(session, DOMAIN)
             print(f"ok   provisioned alice@{DOMAIN} and bob@{DOMAIN}")
 
             # One email, TWO recipients at the same reseller -> one message row.

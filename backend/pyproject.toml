@@ -35,6 +35,12 @@ dependencies = [
     # S3 and MinIO, one client for both — HLD §14's cloud-agnostic promise. Blocking,
     # so calls are wrapped in stdlib asyncio.to_thread rather than adding aioboto3.
     "boto3~=1.35",
+    # Block L1: reading the TXT record that proves a reseller controls a domain's DNS.
+    # Python has no stdlib TXT lookup — `socket` resolves names to addresses and nothing
+    # else. DNS is a binary protocol over UDP that truncates and retries over TCP, so
+    # hand-writing a resolver is exactly what code rule 3 forbids. Async-native, which
+    # matches the rest of the API.
+    "dnspython~=2.7",
     "alembic~=1.14",           # database migrations
     # Sync Postgres driver, used ONLY by Alembic. The app itself uses asyncpg.
     # Migrations run once, on one connection, then exit — async buys nothing there,

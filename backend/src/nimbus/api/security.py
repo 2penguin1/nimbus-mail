@@ -8,7 +8,9 @@ the URL or the body. Every query filters on it. One missed filter is a cross-ten
 data leak, which is the worst bug this system can have.
 """
 
+import base64
 import hashlib
+import hmac
 import secrets
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -99,6 +101,80 @@ def read_token(token: str) -> str | None:
         return payload["sub"]
     except (jwt.InvalidTokenError, KeyError):
         return None
+
+
+# --------------------------------------------------------------------------
+# Domain ownership challenge — block L1, HLD §9.6a
+# --------------------------------------------------------------------------
+#
+# Derived from the domain id, never stored: no column, no migration, no expiry to
+# manage, and stable across restarts so a reseller can re-read it whenever they like.
+#
+# The label is domain separation, and it is not decoration. Without it this value and
+# a session token would be two different meanings signed by one secret, and a
+# construction that lets one stand in for the other is how key-reuse bugs happen.
+#
+# Trade-off taken: the challenge cannot be rotated without rotating JWT_SECRET. That is
+# acceptable because a leaked challenge is worthless on its own — using it still needs
+# write access to the domain's DNS zone, which is the whole thing being proven.
+
+_CHALLENGE_LABEL = b"nimbus-domain-verify:"
+
+# Where the reseller publishes it. A dedicated subdomain rather than the apex, so we
+# never read (or have an opinion about) the SPF and DMARC records living at the root.
+CHALLENGE_HOST = "_nimbus-challenge"
+
+
+def domain_challenge(domain_id: uuid.UUID) -> str:
+    """The TXT value a reseller must publish to prove it controls this domain."""
+    mac = hmac.new(
+        settings.jwt_secret.encode(),
+        _CHALLENGE_LABEL + str(domain_id).encode(),
+        hashlib.sha256,
+    ).digest()
+    # base32, not base64, and not hex. DNS control panels routinely change the case of
+    # what you paste, and base32's alphabet is A-Z2-7 — so upper-casing on compare is
+    # lossless. base64 uses 'a' and 'A' to mean different things, so the same
+    # normalisation would corrupt it. Hex would be twice as long for no gain.
+    return base64.b32encode(mac).decode().rstrip("=")
+
+
+def challenge_matches(found: str, expected: str) -> bool:
+    """True if a TXT value we read equals the challenge we expect. Never raises.
+
+    Case-insensitive (see above) and constant-time. The timing leak is mild — an
+    attacker would be guessing a value they can read from `GET /v1/domains` with their
+    own key — but comparing secrets with `==` is a habit worth not having.
+
+    **Non-ASCII means no match, and it must not raise.** `hmac.compare_digest` REFUSES a
+    `str` holding non-ASCII — it raises TypeError rather than returning False:
+
+        compare_digest("\\ufffd" + token, token)  ->  TypeError
+
+    Two ways that reaches this function. A reseller pastes the token out of a rendered
+    doc and brings a smart quote with it; or an unrelated TXT record at the same host
+    holds non-ASCII bytes, which `_lookup_txt` decodes to U+FFFD. Either one turned
+    `POST /verify` into a 500 — and intermittently, because `any()` short-circuits, so
+    the same domain passed or 500'd depending on the order DNS returned its records in.
+
+    **Rejected rather than sanitised, deliberately.** Stripping the offending bytes and
+    comparing what is left also avoids the 500, and was the first fix written here. It
+    is worse: it makes `X<junk>Y<junk>Z` verify against `XYZ`, so a genuinely corrupted
+    DNS record passes and the reseller never learns their record is wrong. There is no
+    security hole either way — constructing such a value needs the token AND write
+    access to the zone — but silently accepting a broken record hides a misconfiguration
+    that the 409's "check the value was pasted whole" would have named.
+
+    `.strip()` and `.upper()` stay, because those forgive what DNS panels do to a value
+    without changing it. Dropping characters is not in that category.
+
+    Same shape as the `\\x00` bug in `search_query.parse()`: fix it at the one point
+    every value passes through, not at each call site.
+    """
+    clean = found.strip().upper()
+    if not clean.isascii():
+        return False
+    return hmac.compare_digest(clean, expected.upper())
 
 
 # --------------------------------------------------------------------------

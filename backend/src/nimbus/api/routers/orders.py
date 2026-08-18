@@ -116,7 +116,15 @@ async def create_order(
     # Only the new addresses, not a full rebuild — see nimbus.api.addresses.add. If this
     # write is lost to a crash, the next API startup rebuilds the set from Postgres and
     # heals it, which is why Redis is a cache here and not the source of truth.
-    await addresses.add([m["address"] for m in result["mailboxes"]])
+    #
+    # ...and only for a VERIFIED domain (§9.6a). An unverified one still gets its rows
+    # and its temporary passwords; what it does not get is the ability to receive mail.
+    # The flag is re-read rather than assumed, because this endpoint reuses a domain the
+    # reseller may have verified in an earlier order.
+    if await session.scalar(
+        select(Domain.verified).where(Domain.id == uuid.UUID(result["domain_id"]))
+    ):
+        await addresses.add([m["address"] for m in result["mailboxes"]])
 
     webhook_url = await session.scalar(
         select(Reseller.webhook_url).where(Reseller.id == reseller_id)
@@ -124,9 +132,9 @@ async def create_order(
     if webhook_url:
         background.add_task(webhooks.call, webhook_url, result)
 
-    return {**result, "mailboxes": [
+    return await _with_verification(session, {**result, "mailboxes": [
         {**m, "temp_password": passwords[m["local_part"]]} for m in result["mailboxes"]
-    ]}
+    ]})
 
 
 @router.get("/{order_id}")
@@ -167,7 +175,34 @@ async def _find_existing_order(session: AsyncSession, idempotency_key: str, rese
     )
     if row is None:
         return None
-    return {**row, "replayed": True}
+    return await _with_verification(session, {**row, "replayed": True})
+
+
+async def _with_verification(session: AsyncSession, result: dict) -> dict:
+    """Stamp the domain's CURRENT verification state onto an order result.
+
+    Read fresh every time rather than stored, because a replay of a months-old order
+    must not resurrect months-old advice (§9.6a).
+
+    The challenge itself is not inlined here. `GET /v1/domains` is always current, and
+    pointing at it keeps the token out of `provision_order.result` — which is a JSON
+    column that also gets POSTed to the reseller's `webhook_url`. Writing a credential
+    into a row and shipping it to a third party is a bigger promise than this endpoint
+    needs to make, and it would go stale on a `JWT_SECRET` rotation while the endpoint
+    would not.
+    """
+    verified = await session.scalar(
+        select(Domain.verified).where(Domain.id == uuid.UUID(result["domain_id"]))
+    )
+    return {
+        **result,
+        "verified": bool(verified),
+        "next_step": None if verified else {
+            "why": "this domain cannot receive mail until you prove you control its DNS",
+            "how": f"GET /v1/domains returns the exact TXT record to publish for {result['domain']}",
+            "then_call": f"POST /v1/domains/{result['domain_id']}/verify",
+        },
+    }
 
 
 async def _provision(
@@ -239,6 +274,12 @@ async def _provision(
             "address": f"{name}@{req.domain}",
         })
 
+    # Verification state is deliberately NOT stored here. It is a fact about *now*, and
+    # this dict is frozen into provision_order.result and replayed verbatim for ever —
+    # so a stored copy would tell a reseller who has since verified their domain to go
+    # and publish a DNS record they already published, at the exact moment they are
+    # least sure what state they are in. `_with_verification` stamps it on the way out
+    # instead, for the first response and every replay alike.
     result = {
         "order_id": str(order_id),
         "domain": req.domain,
