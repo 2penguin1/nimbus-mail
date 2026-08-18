@@ -1,8 +1,8 @@
 # Nimbus — High Level Design
 
-**Version:** 1.4 (living document — expect this to change as we build)
+**Version:** 1.5 (living document — expect this to change as we build)
 **Author:** Sujal Kumar Singh
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-18
 
 > **New here? Do not start with this file.**
 > `OVERVIEW.md` explains the system in plain English. `ARCHITECTURE.md` draws every
@@ -1178,16 +1178,85 @@ These are the interview talking points. Each has a real answer in the code.
 
 ## 13. Non-functional targets
 
-These are what Day 9's load test must prove:
+All six now have numbers. Block J (`backend/scripts/loadtest.py`) measured the first two;
+the rest were settled by the blocks that built them.
 
-| Metric | Target |
-|---|---|
-| Dedup ratio on realistic data | > 60% storage saved |
-| SMTP ingest rate | > 500 messages/min sustained |
-| Receiver memory with 25 MB attachments | Flat — no growth with attachment size |
-| Search p95 (100k-message mailbox) | < 100 ms — **measured 5 ms typical, 73–76 ms worst** |
-| Snooze accuracy | **exact.** Nothing fires — `snooze_until > now()` is evaluated at read time, so there is no timer to be late (§9.5) |
-| Pending snoozes held | 1M — but they are just rows with a timestamp, so there is nothing to degrade |
+| Metric | Target | Measured |
+|---|---|---|
+| Dedup ratio on realistic data | > 60% storage saved | **68.8%** on 10,000 messages, seed 42 (§13.1) |
+| SMTP ingest rate | > 500 messages/min sustained | **500/min held**, peak backlog 6 messages, final 0 (§13.2) |
+| Receiver memory with 25 MB attachments | Flat — no growth with attachment size | 212 MB of concurrent mail through 84 MB RSS (block B) |
+| Search p95 (100k-message mailbox) | < 100 ms | **5 ms typical, 73–76 ms worst** (block F) |
+| Snooze accuracy | **exact.** Nothing fires — `snooze_until > now()` is evaluated at read time, so there is no timer to be late (§9.5) | exact by construction |
+| Pending snoozes held | 1M — but they are just rows with a timestamp, so there is nothing to degrade | nothing to degrade |
+
+### 13.1 The dedup number is a property of the corpus, not the engine
+
+This is the whole reason the load test publishes its generator. Random attachments dedup
+at ~0%; a corpus built from repeated files dedups at ~100%. Neither proves anything about
+the engine. So the corpus is defined in the open, the ratio it implies is computed
+**before** the run, and the measured number is checked against that prediction.
+
+**The mix**, per 100 messages, and what each share is defending:
+
+| Share | Kind | Why |
+|---|---|---|
+| 70 | no attachment | Most business mail is text. Published attachment rates run 15–25%, so 30% is deliberately generous — and it tilts the result *towards* dedup. Stated because it is the assumption most open to challenge. |
+| 24 | shared attachment | Circulated documents dominate real mail: decks, invoices, policies, re-attached forwards. Fan-out follows a Zipf curve, capped at 100 sends per file. |
+| 6 | unique attachment | Genuinely one-off files exist. Without them the ratio is fiction. |
+
+Attachment sizes: 55% at 20–200 KB, 35% at 200 KB–2 MB, 9% at 2–10 MB, 1% at 10–25 MB.
+Mean ≈ 1.15 MB. Recipients per message: 60% to one mailbox, 30% to 2–5, 10% to 6–40 —
+mean 3.95. At n = 10,000 that is 39,497 deliveries over 720 distinct files.
+
+**Three ratios are published, because any one of them alone lies.**
+
+| | What it divides | Seed 42 |
+|---|---|---|
+| **R1** dedup alone | distinct stored bytes ÷ attachment bytes across messages | **68.8%** |
+| **R2** dedup + fan-out | distinct stored bytes ÷ attachment bytes across copies | **92.0%** |
+| **R3** real disk today | chunks + raw `.eml` ÷ what a naive server writes | **68.4%** |
+| **R3** after the §11.2 expiry | chunks only ÷ what a naive server writes | **94.2%** |
+
+R2 is the flattering one and most of it is **fan-out**, which any mail server gets free by
+storing one message and many pointers — it is not what the dedup engine earned. R1 is.
+R3 is the only figure that survives contact with `df`, and it is far below R2 because the
+raw `.eml` archive measured **3,635 MB against the chunk store's 824 MB — 4.4x** — and
+deduplicates against nothing. §11.2 measured 6.5x on a different mix; block J reproduces
+the phenomenon independently at scale. For the first seven days, most of what Nimbus
+stores is the thing it does not deduplicate.
+
+**The spread is itself the finding.** Across seeds 42–46 the same mix yields R1 from
+**65.7% to 78.3% — a 12.6-point swing**, driven by whether a large file lands at a high
+fan-out rank. A single published number without that spread beside it would be
+misleading. The headline is seed 42's figure, not the best of five.
+
+**What the corpus cannot show.** Attachments are random bytes, so two distinct files share
+no partial content. Fixed 4 MB chunking therefore reclaims nothing that whole-file hashing
+would not already catch, and the measured sub-chunk saving is ≈ 0. That is a **floor** for
+the content-defined chunking named in `dedup.py`'s `# ponytail:` comment, never a ceiling —
+real documents from one template do share runs that a rolling hash would find. §16's first
+open question stays open.
+
+### 13.2 The ingest number measures what was held, not what is possible
+
+500 msg/min is the rate the driver **offered**; the system held it with a peak backlog of
+6 messages and a final backlog of zero, at 0.0 s of schedule debt. That proves the target.
+It is **not** the ceiling — nothing was saturated. Finding the maximum means raising
+`--rate` until the check fails, which block K's sizing needs and this run did not do.
+
+Two distinctions the script is built around, both of which flatter the number if blurred:
+
+- **Durable, not accepted.** A `250` from the receiver means the bytes reached
+  `nimbus-raw` and an event reached Kafka. The mail does not exist to any user until the
+  worker commits its rows. The published figure counts committed `message` rows; the
+  accept rate is printed beside it and labelled as the receiver's number.
+- **Steady state, not the whole run.** The first and last 10% are discarded. The start
+  pays for plan caching, bucket metadata and Kafka leadership election; the tail is the
+  worker draining a queue with nothing arriving, which is not a sustained rate at all.
+
+**Every number here is a floor.** The driver, Postgres, MinIO, Redpanda and the worker all
+compete for one laptop's CPU and disk. On separate hardware each would be higher.
 
 **The search number needs both figures, not the flattering one.** 5 ms is a selective
 word — the common case. The worst realistic query is one matching most of the mailbox
@@ -1198,11 +1267,49 @@ is roughly one mailbox of 100k messages; the upgrade path is an index on
 `(mailbox_id, received_at DESC)`, deliberately not added because it would cost every
 delivery a write to serve a query shape that currently passes.
 
-**The dedup number is a property of the test corpus, not the engine.** Random messages
-dedup at ~0%; a corpus built only from repeated files dedups at ~100%. Neither proves
-anything. Define the corpus first and state it next to the result: N senders, a pool of
-M attachments, fan-out drawn from a realistic distribution, plus a share of unique
-files. Publish the generator with the number.
+### 13.3 Reproducing it
+
+```
+cd backend
+uv run python scripts/loadtest.py --corpus-only            # the mix, no stack needed
+uv run python scripts/loadtest.py --messages 10000 --rate 500 --seed 42
+```
+
+`--seed` **is** the corpus. Attachment bytes come from `random.Random(seed).randbytes()`,
+so 10,000 messages describing ~4.5 GB of mail are fully specified by two integers and
+nothing is generated on disk. Publishing the seed satisfies §13.1's demand that the
+generator ship with the number.
+
+`backend/tests/unit/test_loadtest_corpus.py` asserts the predicted ratios offline, so the
+figures above cannot drift away from the code without a test failing.
+
+### 13.4 Which build produced these numbers
+
+Stated because it matters and would otherwise be invisible. The 10,000-message run that
+produced 68.8% / 500 msg/min completed on the build **before** review. That build had 8
+integrity checks; review then added 3 more, comparing the **absolute** byte totals against
+the corpus prediction rather than only their ratio (§13.1's arithmetic cancels a scaled
+error, so the ratio alone cannot catch one).
+
+The gap does not invalidate the figures, and there is a specific reason to say so rather
+than assert it. The reviewer independently computed seed 42's expected physical total as
+**863,750,806 bytes** from the corpus definition; the run measured **863,750,806**, and the
+per-message and per-copy totals matched their predictions the same way. So the checks that
+were missing would have passed. But that agreement was verified by hand after the fact, not
+by the run itself.
+
+**The re-run on the checked build is still owed.** It was started and killed externally at
+8,859 of 10,000 messages; its data was removed with `--cleanup` and the database returned
+to its exact prior baseline. Anyone repeating this should run the command in §13.3 and
+confirm all 11 checks pass before quoting the numbers as machine-verified.
+
+**The standard run is 10,000 messages, not the 100,000 §15 originally named.** 100k costs
+~59 GB — 47 GB of it the raw `.eml` archive — and 3.5 hours on a laptop that is also
+hosting the whole stack, which makes iterating on a failure impossible. The ratio is a
+property of the mix and the mix is identical at both sizes, so 10k measures it exactly;
+what 10k does not measure is anything that only breaks at volume — GIN maintenance at 4M
+rows, worker memory drift over hours, sustained multi-hour Kafka lag. Same generator, one
+flag apart: run 100k before block K if a machine with the disk is free.
 
 ---
 
@@ -1280,7 +1387,7 @@ wait for.
 | **G** | ~~Quota (logical vs physical) + garbage collection worker~~ **DONE** — `GET /v1/quota`, three-phase sweep in `nimbus/gc.py` with `--dry-run`. Migration `9c3e5a1d7b42` adds the grace clock the design always assumed existed. Verified live: a sweep leaves a shared attachment byte-identical for the mailbox still holding it, a doubly-referenced chunk reaches 0, no refcount goes negative, `used_bytes` reconciles. | D | **high** |
 | **H** | ~~Snooze — Redis sorted set + Go worker~~ **DONE, and it is none of those things.** Snooze is the predicate `snooze_until > now()`, evaluated at read time. Migration `c81f4e6a29d3` drops `is_snoozed`; `PATCH` gains `snooze_until`; the list gains `?snoozed=`. No Redis, no worker, no poll, no lock, no leader election. Verified: a message snoozed for 3 seconds returned by itself with nothing running. | D | medium |
 | **I** | ~~React UI + savings dashboard~~ **DONE** — Vite + React 19 + TypeScript, 5 runtime dependencies, 6 screens. Sender HTML renders in a sandboxed iframe with a prepended CSP; verified against crafted hostile mail that every vector is blocked by the browser. Storage screen shows logical vs physical with both §11.1 caveats. No compose, anywhere. | E F G H | medium |
-| **J** | **Load test** — 100k messages, measure everything in §13 | D | medium |
+| **J** | ~~Load test — 100k messages, measure everything in §13~~ **DONE** — `scripts/loadtest.py`: a seeded corpus generator, a paced SMTP driver and a measurement pass, in one operator script with no new dependencies. It measures the **two** §13 numbers that were unproven; the other four were settled by the blocks that built them, so "everything in §13" was never this script's job. Standard run is **10,000** messages, not 100k — §13.3 says why. Verified: 68.8% dedup, 500 msg/min held, 8 integrity checks passing — see §13.4 on which build produced that run. | D | medium |
 | **K** | AWS deploy, README, architecture diagram | J | low |
 
 **Critical path:** A → B → C → D. Everything interesting hangs off D, so get there first.
@@ -1300,7 +1407,7 @@ Two things take real-world time no matter how fast the code is written:
 
 | Thing | Time | What to do about it |
 |---|---|---|
-| **The load test itself** | 100k messages at the §13 target of 500/min is **~3.5 hours** of wall clock | Start it as soon as block D works, and build I and K while it runs. Do not sit and watch it. |
+| **The load test itself** | 100k messages at the §13 target of 500/min is **~3.5 hours** of wall clock | Settled: the standard run is 10,000 messages and takes **20 minutes**. §13.3 states what shrinking it costs. 100k stays available behind one flag. |
 | **AWS port 25 unblock** | AWS takes **several days** to approve the request | File it **before writing any code**. It is a form, it costs nothing, and if it is forgotten there is no real inbound mail on the deployed system. §14 already flags this. |
 
 Everything else is just writing code.
@@ -1313,7 +1420,15 @@ not re-implementing 1982.
 
 ## 16. Open questions (to refine)
 
-- [ ] Fixed 4 MB chunks vs content-defined chunking — is fixed enough to hit >60% dedup on realistic mail?
+- [ ] Fixed 4 MB chunks vs content-defined chunking — is fixed enough to hit >60% dedup on
+  realistic mail? **Half answered by block J, and the half it answered is the less
+  interesting one.** Fixed chunking cleared the target comfortably (68.8%) — but on that
+  corpus every saved byte came from *whole files* being sent to many people, not from
+  chunk-level overlap, because random attachment bytes share no partial content. Measured
+  sub-chunk saving was ≈ 0, which is a floor and not a ceiling. The open question is
+  therefore unchanged and now sharper: **on real documents generated from shared
+  templates, how much does a rolling hash find that whole-file hashing misses?** Answering
+  it needs a corpus of real files, which the synthetic generator deliberately is not.
 - [x] **Per-mailbox search: one table with `mailbox_id` leading a composite GIN index.**
   Not partitions. Benchmarked, not argued: on a 100k-message mailbox with a second tenant
   holding 50k rows containing the same word, `GIN (mailbox_id, tsv)` read 1,000 rows in

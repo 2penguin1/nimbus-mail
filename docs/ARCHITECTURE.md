@@ -1,8 +1,8 @@
 # Nimbus — Architecture in Diagrams
 
-**Version:** 1.5
+**Version:** 1.6
 **Author:** Sujal Kumar Singh
-**Last updated:** 2026-08-12
+**Last updated:** 2026-08-18
 
 Every part of the system, drawn. Almost no prose — each diagram gets one line saying
 what it shows and a few points that matter.
@@ -36,6 +36,7 @@ what it shows and a few points that matter.
 | 18 | Auth: two doors |
 | 19 | Provisioning without double-creating |
 | 20 | Build order |
+| 21 | The load test: which bytes each ratio divides |
 
 ---
 
@@ -1024,10 +1025,57 @@ about who owns it, or an API key becomes a tool for probing other tenants.
 | G | D | **high** | GC is the subtle one |
 | H | D | medium | |
 | I | E F G H | medium | Shell can be built early against mock JSON |
-| J | D | medium | Runs ~3.5 hours. Start early, build I while it runs. |
+| J | D | medium | 10,000 messages, ~20 min. 100k available behind a flag (HLD §13.3). |
 | K | J | low | Blocked on the AWS port 25 unblock |
 
 **Critical path:** A → B → C → D. After D, five things run independently.
+
+---
+
+## 21. The load test: which bytes each ratio divides
+
+Diagram 6 shows the idea. This shows the measurement, and why one number is not enough.
+
+```
+   seed 42 — 10,000 messages, 39,497 deliveries, 720 distinct files
+   ═══════════════════════════════════════════════════════════════
+
+   attachment bytes across COPIES     10,233 MB  ████████████████████████
+   what a naive server writes         14,112 MB  ██████████████████████████████
+   raw .eml archive  (7-day life)      3,635 MB  ████████
+   attachment bytes across MESSAGES    2,639 MB  ██████
+   stored in the chunk store             824 MB  ██
+
+   R1  = 1 -  824 / 2,639            = 68.8%   what dedup EARNED
+   R2  = 1 -  824 / 10,233           = 92.0%   dedup + fan-out
+   R3  = 1 - (824+3,635) / 14,112    = 68.4%   real disk, today
+   R3' = 1 -  824 / 14,112           = 94.2%   real disk, after raw expires
+```
+
+**Read R1 first.** R2 is bigger because it counts fan-out — one message reaching four
+mailboxes writes one copy of the bytes and four `mailbox_message` rows. Every mail server
+does that. It is not what the dedup engine earned; R1 is.
+
+**R3 is the one that matches `df`.** It is far below R2 because the raw `.eml` archive is
+**4.4x the chunk store** and deduplicates against nothing — forty emails carrying one deck
+write forty full copies, each with its own random key. For the first seven days, most of
+what Nimbus stores is the thing it does not deduplicate. HLD §11.2 chose a lifecycle rule
+over deleting it in GC, and R3' is what the store looks like once that rule fires.
+
+```
+   WHY THE RATIO ALONE CANNOT BE TRUSTED
+
+   R1 = 1 - physical / logical          both sides scale together if the
+                                        worker stores the WRONG bytes
+
+   worker regresses to storing base64 instead of decoded:
+       physical  824 MB  ->  1,129 MB   (x1.37)
+       logical 2,639 MB  ->  3,616 MB   (x1.37)
+       R1        68.8%   ->    68.8%    <-- UNCHANGED. Test says PASS.
+
+   So the run also checks the ABSOLUTE totals against the corpus prediction,
+   not just their quotient. Found by review, after the checks were written.
+```
 
 ---
 

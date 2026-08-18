@@ -1,8 +1,8 @@
 # Nimbus — How It Works
 
-**Version:** 1.1
+**Version:** 1.2
 **Author:** Sujal Kumar Singh
-**Last updated:** 2026-08-10
+**Last updated:** 2026-08-18
 
 This is the plain-English version. Read this to understand the system.
 
@@ -344,19 +344,34 @@ The dashboard shows both side by side. That contrast is the demo.
 
 ## 13. How we know it worked
 
-| What we measure | Target |
-|---|---|
-| Disk saved on realistic mail | more than 60% |
-| Mail accepted per minute | more than 500, kept up |
-| Memory while receiving 25 MB files | flat — does not grow with file size |
-| Search on a 100,000-message mailbox | under 100 ms for 95% of searches — **measured: 5 ms for an ordinary word, 73–76 ms for a search matching nearly the whole mailbox** |
-| Snooze accuracy | **exact** — nothing fires, so nothing can be late |
-| Timers we can hold at once | 1 million, no slowdown |
+All six have been measured.
 
-**Important honesty note on the first row.** That 60% is decided by the test emails
+| What we measure | Target | What we got |
+|---|---|---|
+| Disk saved on realistic mail | more than 60% | **68.8%** on 10,000 emails |
+| Mail accepted per minute | more than 500, kept up | **500, kept up** — never more than 6 emails behind |
+| Memory while receiving 25 MB files | flat — does not grow with file size | 212 MB of mail through 84 MB of memory |
+| Search on a 100,000-message mailbox | under 100 ms for 95% of searches | **5 ms** for an ordinary word, **73–76 ms** for a search matching nearly the whole mailbox |
+| Snooze accuracy | **exact** — nothing fires, so nothing can be late | exact |
+| Timers we can hold at once | 1 million, no slowdown | nothing to slow down — they are just rows |
+
+**Important honesty note on the first row.** That number is decided by the test emails
 we generate, not by the code. Random files dedup at 0%. All-identical files dedup at
-100%. Neither proves anything. We must write down what the test set contains and
-publish it next to the number.
+100%. Neither proves anything. So we write down exactly what the test set contains and
+publish it next to the number — and the whole test set is reproducible from a single
+number, the "seed". Change the seed and the same recipe gives anything from **65.7% to
+78.3%**. That swing is not noise to hide; it is the honest width of the claim.
+
+**And a second honesty note, on what "saved" counts.** 68.8% is the saving on
+*attachments*. We also keep the original raw email for 7 days, and that copy is not
+deduplicated at all — forty emails carrying one slide deck keep forty full copies of it.
+Measured, that raw pile was **4.4 times bigger** than the deduplicated store. So the
+saving on the disk you actually pay for is **68.4% today, and 94.2% once the 7-day
+copies expire**. The bigger number is real, it just arrives a week late.
+
+**One thing this does not tell us.** 500 emails a minute is the rate we *asked* for, and
+the system kept up without straining. It is not the maximum — we never found the ceiling.
+That matters for choosing the size of the server in the final step.
 
 ---
 

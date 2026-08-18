@@ -106,6 +106,9 @@ backend/
     integration/     marked `integration`, need the live stack
   scripts/           one-off operator tools (create_reseller.py,
                      apply_raw_retention.py)
+    loadtest.py      block J. Seeded corpus + paced SMTP driver + measurement,
+                     one file. NOT in tests/integration/ on purpose: a 20-minute
+                     6 GB measurement must never join the default pytest run
   smtp-receiver/     Go SMTP receiver (block B)             DONE
                      No snooze/ worker: block H has none, deliberately
 frontend/            React + TypeScript webmail UI          DONE (block I)
@@ -147,7 +150,7 @@ collisions. An exception aborts the whole transaction and ties the code to how
 SQLAlchemy happens to wrap asyncpg's error types.
 
 Build order is `docs/HLD.md` §15. Built so far: blocks **A**, **B**, **C**, **D**, **E**,
-**F**, **G** and **H**. In progress: **I** (React UI). Next: **J** (load test), **K** (deploy).
+**F**, **G**, **H**, **I** and **J**. Next: **K** (deploy).
 
 **Layout rules.** `src/nimbus/` is an installed package, so there is exactly one way to
 import anything: `from nimbus.models import Blob`. No `sys.path` juggling, no relative
@@ -460,8 +463,8 @@ Design detail belongs in `docs/`, not here. This file stays short enough to be r
   `chunk.refcount`. Measured: two deliveries of one 10 MB attachment → 1 blob,
   3 chunks, 3 S3 objects, **50% saved**. Reviewed by an independent agent — 12 findings,
   6 fixed. New: `message_thread_lookup_idx` migration for the threading lookup.
-- Next: **block D** — routing chain and fan-out delivery. It writes the
-  `mailbox_message` rows and is the only thing that may move `blob.refcount`.
+  (That "Next: block D" line lived here long after D shipped. Status lines rot — when a
+  block lands, delete the line that pointed at it.)
 
 - **Block D DONE and verified live.** Routing chain and fan-out. `worker/routing.py`:
   alias → mailbox → catch-all → drop, returning a SET so two addresses reaching one
@@ -594,6 +597,68 @@ what it scoped before trusting any of it.
   now takes `?mailbox_id=` and 409s on ambiguity, like PATCH and DELETE. Found by the
   block I architect while reading the API, not by any backend review.
 
+- **Block J DONE and verified live.** The load test. `scripts/loadtest.py` — seeded corpus
+  generator, paced SMTP driver, measurement and cleanup in one operator script, zero new
+  dependencies. **90 unit tests pass.** Measured on 10,000 messages / 39,497 deliveries:
+  **68.8% dedup (R1)**, **500 msg/min held** with a peak backlog of 6 and a final backlog
+  of zero. Reviewed by two skills-loaded agents — 16 findings, 15 applied, 2 rejected with
+  evidence. HLD §13 now carries all six numbers; §13.1 defines the corpus.
+- **Owed on block J: the re-run on the post-review build.** The figures above come from the
+  run that completed BEFORE review added the three absolute-byte checks. They are not
+  suspect — the reviewer independently predicted 863,750,806 physical bytes and the run
+  measured exactly that — but the agreement was checked by hand, not by the run. A re-run
+  was started and killed externally at 8,859/10,000; `--cleanup` removed its data and the
+  database returned to its exact prior baseline (verified). HLD §13.4 records this.
+
+**Five rules block J establishes:**
+
+1. **A ratio cannot check itself.** R1 is `1 - physical/logical`, so any error scaling both
+   sides cancels. If the worker regressed to storing base64 instead of decoded bytes, every
+   count, every refcount, the S3-vs-database cross-check and the ratio ALL still pass while
+   37% of the store is wasted. The run now checks the **absolute** byte totals against the
+   corpus prediction too. A reviewer found this after the checks were written; the fix is
+   three lines and it is the single most valuable thing the review produced.
+2. **A paced load test cannot exceed the rate it offers.** `if measured < 500: FAIL` was
+   wrong twice over — a one-second lag change over a 960 s window prints FAIL on a healthy
+   system, and the only way to *exceed* the offered rate is for the worker to be draining a
+   backlog, so the check rewarded lag. The right assertion is "held the offered rate, final
+   queue depth zero". Finding the ceiling is a different run at a much higher `--rate`.
+3. **A destructive operator flag needs a name guard, not just an id.** `--cleanup <UUID>`
+   would delete any reseller's messages, blobs, chunks, mailboxes and S3 objects. It now
+   refuses anything not named `loadtest-*`. Related: it took a raw string, and while
+   Postgres normalises UUID case, the S3 prefix is a literal match — an uppercase paste
+   would delete every row and match zero objects, stranding those bytes with no row left
+   to find them.
+4. **`smtplib` returns partial recipient refusals, it does not raise them.**
+   `SMTPRecipientsRefused` fires only when EVERY recipient is refused; a partial refusal is
+   the return value. Ignoring it meant one stale Redis entry in a 40-way broadcast silently
+   shrank the corpus — and a shrinking corpus RAISES the dedup ratio.
+5. **The corpus IS the number.** Across seeds 42–46 the same mix gives R1 from 65.7% to
+   78.3%. Publishing one figure without that spread is misleading, so `--corpus-only`
+   prints the spread and a unit test asserts it stays wide.
+
+**Two tooling traps found, both the same class as block G's missing-git finding:**
+
+- **`security-review` cannot load in this repo** — it shells `git diff origin/HEAD...` and
+  there is no remote. Git existing is not enough; some tooling wants an upstream.
+- **`feature-dev:code-architect` is an AGENT type, not a skill.** `Skill(skill=...)` on it
+  returns "Unknown skill". Agent prompts must say `Agent(subagent_type=...)` for that one
+  and reserve `Skill()` for real skills (`ponytail:ponytail`, `code-review`).
+
+**Three things block J confirmed that were only asserted before:**
+
+1. **The raw `.eml` archive dominates the store.** 3,635 MB against the chunk store's
+   824 MB — **4.4x**, independently reproducing §11.2's 6.5x on a different mix. R3 (real
+   disk today) is 68.4% while R3 after the 7-day expiry is 94.2%. For the first week, most
+   of what Nimbus stores is the thing it does not deduplicate.
+2. **Fixed 4 MB chunking is not what earned the ratio.** On random attachment bytes,
+   sub-chunk saving measured ≈ 0 — every saved byte came from whole files being sent to
+   many people. That is a floor for content-defined chunking, not a ceiling, and it makes
+   §16's first open question sharper rather than answered.
+3. **One worker consumed all 4 Kafka partitions at 500/min without breaking a sweat** —
+   peak backlog 6 messages. The 4-partition ceiling on the consumer group is therefore
+   still untested, and the queue-depth curve is the instrument that would expose it.
+
 **Three things block F fixed that were latent in the schema from day one:**
 
 1. `message_index`'s GIN index was on `tsv` alone, so the tenant filter could not use it.
@@ -674,7 +739,14 @@ cryptographically valid. #1 and #5 have offline checks (`go build`/`go test`,
 32-byte HS256 floor (RFC 7518 §3.2), which PyJWT warns about on every call. A guessable
 signing key forges a token for any mailbox in any tenant. `config.py` now refuses to
 start below 32 bytes; HLD §14 lists the secrets a deploy must set.
-- Critical path is A → B → C → D. Everything else hangs off D.
+- Critical path is A → B → C → D. Everything else hangs off D. **A–J are done; only K
+  (AWS deploy) remains.**
+- **Block K inherits an unsettled sizing question from J.** The load test measured a
+  laptop, and every figure it produced is a floor. §14 puts the API, worker, receiver AND
+  a self-hosted Redpanda on one `t3.small` — 2 GiB total — against a worker that peaks at
+  187 MB per 25 MB attachment (block C) and a receiver whose `MAX_CONNECTIONS=100` is a
+  1.4 GB worst case (§9.1a). Those numbers do not fit. Decide the instance size or lower
+  the cap before deploying, not after an OOM.
 - **Outstanding on Sujal:** file the AWS port 25 unblock request. Takes AWS several days;
   nothing else can make it faster. Only needed if the deployed system must receive real mail.
 - Open decisions still unsettled: `docs/HLD.md` §16
