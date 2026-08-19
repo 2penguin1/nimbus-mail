@@ -1,6 +1,6 @@
 import { Link } from "react-router";
 import type { MessageRow as Row } from "../types.ts";
-import { bytes, isSnoozed, until, when } from "../format.ts";
+import { bytes, isSnoozed, sender, until, when } from "../format.ts";
 
 /* One list row, shared by the inbox and by search — both endpoints return the same
  * shape, so two components would be two places to fix a rendering bug.
@@ -40,7 +40,11 @@ export function MessageRow({
           <span className="sr-only">Unread</span>
         </span>
 
-        <span className="row__from">{row.from ?? "(no sender)"}</span>
+        {/* The display name only. `title` keeps the full header one hover away — see
+         * format.sender for why the address is demoted rather than shown. */}
+        <span className="row__from" title={row.from ?? undefined}>
+          {sender(row.from)}
+        </span>
 
         <span className="row__main">
           <span className="row__subject">{row.subject || "(no subject)"}</span>

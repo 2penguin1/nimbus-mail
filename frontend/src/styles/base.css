@@ -598,8 +598,14 @@ a:hover {
   word-break: break-all;
 }
 
+/* 68ch, not the 820px the container allows. At --fs-4 that container is about 100
+ * characters a line; typographic practice puts comfortable prose at 60–75, and the eye
+ * loses its place returning to the left edge past that. The FACTS table above keeps the
+ * full 820px, because a wide table is easier to scan, not harder — only running prose
+ * has a measure. */
 .msg__body {
   margin-top: var(--sp-7);
+  max-width: 68ch;
   font-size: var(--fs-4);
   line-height: var(--lh-read);
 }
@@ -904,4 +910,51 @@ a:hover {
   .msg__back:hover {
     text-decoration: underline;
   }
+}
+
+/* ─────────────────────── crash screen ────────────────────── */
+/* Shown by ErrorBoundary. Deliberately quiet: this is not an occasion for a big red
+ * panel. The person is already unsettled; the design's job is to say what is true
+ * (nothing was lost) and give them the two buttons that help. */
+
+.crash {
+  padding: var(--sp-8) var(--sp-7);
+  max-width: 60ch;
+}
+
+.crash__title {
+  font-size: var(--fs-6);
+  font-weight: var(--fw-semi);
+  line-height: var(--lh-tight);
+  margin-bottom: var(--sp-4);
+}
+
+.crash__body {
+  color: var(--ink-2);
+  line-height: var(--lh-read);
+  margin-bottom: var(--sp-6);
+}
+
+.crash__actions {
+  display: flex;
+  gap: var(--sp-4);
+  flex-wrap: wrap;
+  margin-bottom: var(--sp-7);
+}
+
+/* The raw message, styled as evidence rather than as an apology. `--s-crit` is the
+ * reserved status hue and it always ships with a word beside it — here the heading
+ * above is that word. */
+.crash__detail {
+  padding: var(--sp-5);
+  background: var(--bg-sunken);
+  border: 1px solid var(--rule);
+  border-left: 2px solid var(--s-crit);
+  border-radius: var(--r-2);
+  font-size: var(--fs-2);
+  line-height: var(--lh-ui);
+  color: var(--ink-2);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
 }

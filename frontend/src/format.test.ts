@@ -14,6 +14,7 @@ import {
   isSnoozed,
   percent,
   savingRatio,
+  sender,
   when,
 } from "./format.ts";
 
@@ -66,4 +67,31 @@ test("when never throws on a bad timestamp", () => {
   assert.equal(when("not-a-date"), "");
   const now = new Date("2026-08-10T12:00:00Z");
   assert.notEqual(when("2026-08-10T09:00:00Z", now), "");
+});
+
+test("sender pulls the display name out of a From header", () => {
+  // The common case, and the reason this exists: the address is 30 characters of
+  // noise in a column 150px wide.
+  assert.equal(sender("Ananya Krishnan <ananya.krishnan@globex-industries.com>"), "Ananya Krishnan");
+
+  // A quoted display name — legal, and common when the name contains a comma.
+  assert.equal(sender('"Doe, John" <j@example.com>'), "Doe, John");
+
+  // No display name: show the address, but not the angle brackets.
+  assert.equal(sender("<procurement@vertex.com>"), "procurement@vertex.com");
+
+  // A bare address is already the best thing we can show.
+  assert.equal(sender("procurement@vertex.com"), "procurement@vertex.com");
+
+  // A display name may legally contain '<', the address may not — so split on the
+  // LAST one. Splitting on the first would return "a " here.
+  assert.equal(sender("a <b> c <real@example.com>"), "a <b> c");
+});
+
+test("sender never returns an empty string", () => {
+  // The row would collapse to nothing and the layout would shift. Every branch has
+  // to produce something printable.
+  for (const input of [null, undefined, "", "   ", "<>", "<   >"]) {
+    assert.ok(sender(input).length > 0, `empty result for ${JSON.stringify(input)}`);
+  }
 });

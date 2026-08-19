@@ -64,6 +64,33 @@ export function until(iso: string): string {
 export const isSnoozed = (iso: string | null | undefined): boolean =>
   !!iso && new Date(iso).getTime() > Date.now();
 
+/** The name a person recognises, out of a raw `From` header.
+ *
+ *  A list row gives the sender about 150px. Spending it on
+ *  `Ananya Krishnan <ananya.krishn…` shows a truncated address nobody reads instead of
+ *  the one thing that identifies the message at a glance. The full header is still on
+ *  the row's `title` and in the message detail, so nothing is lost — it is demoted.
+ *
+ *  The backend parses with `policy.default`, so RFC 2047 encoded words
+ *  (`=?UTF-8?B?…?=`) are already decoded by the time this sees them. This does not
+ *  need to, and must not try to, decode anything.
+ */
+export function sender(from: string | null | undefined): string {
+  const raw = (from ?? "").trim();
+  if (!raw) return "(no sender)";
+
+  // `Display Name <addr>` — take the part before the LAST '<', because a display name
+  // may legally contain one and the address may not.
+  const open = raw.lastIndexOf("<");
+  if (open !== -1 && raw.includes(">", open)) {
+    const name = raw.slice(0, open).trim().replace(/^"(.*)"$/s, "$1").trim();
+    if (name) return name;
+    // `<a@b.com>` with no display name: show the address, without the brackets.
+    return raw.slice(open + 1, raw.indexOf(">", open)).trim() || raw;
+  }
+  return raw;
+}
+
 /** The dashboard's hero number: how many times more disk a naive mail server needs. */
 export function savingRatio(logical: number, physical: number): number | null {
   if (physical <= 0 || logical <= 0 || logical < physical) return null;

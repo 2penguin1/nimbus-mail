@@ -1,5 +1,6 @@
 import { Navigate, Route, Routes, useLocation } from "react-router";
 import { useAuth } from "./auth.tsx";
+import { ErrorBoundary } from "./components/ErrorBoundary.tsx";
 import { Shell } from "./components/Shell.tsx";
 import Login from "./routes/Login.tsx";
 import Mail from "./routes/Mail.tsx";
@@ -15,7 +16,18 @@ function Private({ children }: { children: React.ReactNode }) {
     const next = encodeURIComponent(loc.pathname + loc.search);
     return <Navigate to={`/login?next=${next}`} replace />;
   }
-  return <Shell>{children}</Shell>;
+  // The boundary sits INSIDE Shell, so a route that throws loses the reading pane but
+  // keeps the sidebar — the user can click another folder instead of being stranded on
+  // a dead page.
+  //
+  // Keyed on the path because an error boundary does not reset itself. Without the key
+  // it stays crashed after the user navigates away, which turns one bad message into a
+  // permanently broken app until a reload.
+  return (
+    <Shell>
+      <ErrorBoundary key={loc.pathname}>{children}</ErrorBoundary>
+    </Shell>
+  );
 }
 
 export default function App() {
