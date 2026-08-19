@@ -1659,6 +1659,29 @@ flag apart: run 100k before block K if a machine with the disk is free.
 
 Code stays cloud-agnostic: the same `boto3` client talks to MinIO and S3 unchanged.
 
+**`S3_ENDPOINT` is what switches between them, and it is one variable in both languages.**
+
+| Value | Meaning |
+|---|---|
+| `http://localhost:9000` (or any URL) | MinIO — path-style addressing, `host/bucket/key` |
+| **empty string** | Real AWS — the SDK resolves the regional endpoint, `bucket.host/key` |
+
+Leave it **empty** on AWS. Do not set it to `s3.<region>.amazonaws.com`: S3 buckets
+created after 30 September 2020 support only virtual-hosted style and **reject** the
+path form.
+
+This was a live bug until block K's design review. `smtp-receiver/main.go` set
+`UsePathStyle = true` unconditionally — correct for MinIO, and against a real bucket it
+would have failed **every** raw `.eml` upload. The receiver answers `451` on a storage
+failure (§9.1a), so senders would have retried for days and never succeeded, with
+nothing in the error mentioning S3. It survived block B's review, block B's live test
+and a 10,000-message load test, because every one of those ran against MinIO.
+`smtp-receiver/s3options_test.go` is the offline check that stops it returning.
+
+The Python side reads the same variable and treats empty the same way
+(`storage.py`, `endpoint_url=settings.s3_endpoint or None`). A variable that meant
+different things in each language would be a trap nobody finds until mail stops.
+
 **Configuration comes from `backend/.env`,** read by `nimbus/config.py` — a
 `pydantic-settings` model with **no working defaults**. Real environment variables
 override the file, which is how production is configured: no `.env` on the box,
@@ -1676,7 +1699,11 @@ copies of a database URL is how you migrate the wrong database.
 | `JWT_SECRET` | HS256 signs every mailbox token with it. Anyone who guesses it forges a token for **any mailbox in any tenant** — all of §10.1 isolation, gone. Must be ≥ 32 bytes (RFC 7518 §3.2); the API refuses to start below that rather than trusting a comment to be noticed. |
 | `DATABASE_URL` | The example points at local Docker Compose with the password in it |
 | `S3_SECRET_KEY` | The dev default is in `docker-compose.yml`, in the repo |
-| `MAX_CONNECTIONS` | Set to 50 while the receiver shares a `t3.small` — see §9.1a |
+| `S3_ENDPOINT` | Must be **empty** on AWS. Any value there turns on path-style addressing, which real S3 rejects — see the table above |
+| `MAX_CONNECTIONS` | Sized to the box, not to a fixed number — see §9.1a and block K's budget |
+| `KAFKA_REPLICATION` | **Must stay `1`.** §14 deploys ONE Redpanda node, and `CreateTopic` returns an error for a replication factor it cannot satisfy — `main()` calls `log.Fatalf`, so the receiver never starts and no mail is accepted at all. Raise it only alongside the broker count |
+| `SMTP_DOMAIN` | Defaults to `nimbus.local`. It is the name the server announces to every sender; it must be the real hostname |
+| `REDIS_ADDR`, `DATABASE_URL`, `REDIS_URL`, `KAFKA_SEEDS` | Their defaults carry this laptop's `5433`/`6380`/`19092` port offsets, which exist only because native Postgres and Redis own the standard ports here. Inside Docker they must be `postgres:5432`, `redis:6379`, `redpanda:9092` |
 
 ### Inbound TLS — not implemented in v1
 

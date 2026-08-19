@@ -54,7 +54,10 @@ class Settings(BaseSettings):
     # a wrong default here fails loudly, a defaulted secret fails silently. Bucket and
     # topic names DO get defaults, because a wrong one raises "no such bucket" on the
     # first call — obvious in seconds, and it saves four lines of .env that never change.
-    s3_endpoint: str          # http://localhost:9000 locally; unset/AWS in production
+    # http://localhost:9000 locally (MinIO); EMPTY STRING for real AWS S3, which makes
+    # boto3 resolve the regional endpoint and the Go receiver drop path-style addressing.
+    # Still required with no default, so a deploy has to say which it means.
+    s3_endpoint: str
     s3_access_key: str
     s3_secret_key: str
     s3_region: str = "us-east-1"

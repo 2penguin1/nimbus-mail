@@ -40,7 +40,15 @@ log = logging.getLogger("nimbus.storage")
 # mode also stops retrying the errors that are not worth retrying.
 client = boto3.client(
     "s3",
-    endpoint_url=settings.s3_endpoint,
+    # `or None` is what makes S3_ENDPOINT="" mean "real AWS" rather than "an endpoint
+    # whose address is the empty string". boto3 resolves the regional endpoint itself
+    # when this is None; handed "" it would build nonsense URLs.
+    #
+    # The Go receiver reads the SAME variable and treats empty the SAME way
+    # (smtp-receiver/main.go, s3Options). One value, one meaning, both languages — they
+    # share an env file, so a variable that meant different things in each would be a
+    # trap nobody would find until mail stopped.
+    endpoint_url=settings.s3_endpoint or None,
     aws_access_key_id=settings.s3_access_key,
     aws_secret_access_key=settings.s3_secret_key,
     region_name=settings.s3_region,

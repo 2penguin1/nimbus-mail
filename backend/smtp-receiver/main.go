@@ -89,6 +89,31 @@ func loadConfig() config {
 	}
 }
 
+// s3Options decides between real S3 and a MinIO-shaped endpoint. S3_ENDPOINT alone
+// decides it: empty means AWS, anything else means a custom endpoint.
+//
+// This used to be unconditional `UsePathStyle = true`, which is right for MinIO and
+// WRONG for AWS. MinIO serves buckets as host/bucket/key; S3 buckets created after
+// 30 September 2020 support only bucket.host/key and reject the path form. Against a
+// real bucket every raw .eml upload would have failed, the receiver would have answered
+// 451 (§9.1a), and senders would have retried for days without ever succeeding — a
+// failure that looks like a network problem from both ends.
+//
+// One variable, not two, and the same variable the Python side reads. A separate
+// S3_FORCE_PATH_STYLE flag would let the endpoint and the addressing style disagree,
+// which is a combination nobody wants and somebody would eventually set.
+func s3Options(cfg config) func(*s3.Options) {
+	return func(o *s3.Options) {
+		if cfg.s3Endpoint == "" {
+			// Real AWS. Leave BaseEndpoint nil so the SDK resolves the regional
+			// endpoint itself, and leave UsePathStyle false, which is what S3 wants.
+			return
+		}
+		o.BaseEndpoint = aws.String(cfg.s3Endpoint)
+		o.UsePathStyle = true
+	}
+}
+
 // ensureTopic creates the topic if it is not already there.
 //
 // We do not rely on Kafka's auto-create. It is off by default on Redpanda and is
@@ -97,8 +122,14 @@ func loadConfig() config {
 // rather than at startup. Creating it here fails loudly before we accept anything.
 //
 // Partitions set the ceiling on how many workers can consume in parallel; raising it
-// later is easy, lowering it is not. Replication must be <= the number of brokers, so
-// it is 1 locally and should be 3 in production.
+// later is easy, lowering it is not.
+//
+// KAFKA_REPLICATION must be <= the number of brokers, and it stays 1 everywhere we run,
+// because HLD §14 deploys ONE Redpanda node. An earlier version of this comment said it
+// "should be 3 in production", which is true of a three-broker cluster and a foot-gun
+// here: CreateTopic returns an error for a replication factor it cannot satisfy,
+// main() log.Fatalf's on it, and the receiver never starts. Raise this only alongside
+// the broker count.
 func ensureTopic(ctx context.Context, kc *kgo.Client, cfg config) error {
 	adm := kadm.NewClient(kc)
 
@@ -144,15 +175,11 @@ func main() {
 	}
 	defer rdb.Close()
 
-	// ---- S3 (MinIO locally). UsePathStyle is required: MinIO serves buckets as
-	// host/bucket/key, while real S3 defaults to bucket.host/key.
+	// ---- S3, or MinIO. Which one is decided by S3_ENDPOINT alone — see s3Options.
 	s3Client := s3.NewFromConfig(aws.Config{
 		Region:      env("AWS_REGION", "us-east-1"),
 		Credentials: credentials.NewStaticCredentialsProvider(cfg.s3AccessKey, cfg.s3SecretKey, ""),
-	}, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(cfg.s3Endpoint)
-		o.UsePathStyle = true
-	})
+	}, s3Options(cfg))
 
 	// PartSize x (Concurrency+1) is the SDK's documented memory ceiling per upload.
 	// 5 MB is S3's minimum part size, and concurrency 1 keeps each connection cheap —

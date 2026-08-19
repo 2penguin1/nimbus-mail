@@ -824,6 +824,32 @@ start below 32 bytes; HLD §14 lists the secrets a deploy must set.
   off switch is one wrong env var from being off in production, which is the exact failure L1
   exists to prevent. The escape hatch is per-domain, named, and costs a shell on the box.
 
+- **Three deploy blockers found and FIXED before block K, all in the Go receiver.** Found by
+  the block K architect, verified by reading the code, all three offline-testable now
+  (`smtp-receiver/s3options_test.go`):
+
+  1. **`UsePathStyle = true` was unconditional.** Right for MinIO (`host/bucket/key`),
+     REJECTED by AWS for any bucket created after 30 Sept 2020 (`bucket.host/key`). Against
+     a real bucket every raw `.eml` upload fails, the receiver answers `451` (§9.1a), and
+     senders retry for days without ever succeeding — and nothing in the error says "S3".
+     **It survived block B's review, block B's live test and a 10,000-message load test,
+     because every one of those ran against MinIO.** No amount of local testing could have
+     caught it. Now `S3_ENDPOINT` decides: empty means real AWS, anything else means a
+     custom endpoint with path style.
+  2. **`S3_ENDPOINT` now means the same thing in BOTH languages.** `storage.py` uses
+     `endpoint_url=settings.s3_endpoint or None`. They share one env file, so a variable
+     meaning different things in Python and Go is a trap nobody finds until mail stops.
+     **Do not "fix" the empty string by pointing it at `s3.<region>.amazonaws.com`** — that
+     turns path style back on and breaks it again.
+  3. **A comment said `KAFKA_REPLICATION` "should be 3 in production".** Following it is
+     fatal: §14 deploys one Redpanda node, `CreateTopic` errors on a replication factor it
+     cannot satisfy, and `main()` `log.Fatalf`s — the receiver never starts, so no mail is
+     accepted at all. The default was already correct; the comment was the bug. A test now
+     pins it.
+
+  **The lesson worth keeping:** a local stack that is *shaped* like production is not
+  production. MinIO and S3 differ in exactly one place, and that place had no test.
+
 - **Block L2 is DESIGNED, not built — HLD §9.8, ARCHITECTURE diagram 22.**
   Written up 2026-08-19 after Sujal asked how an organization gets created. Waiting on his
   signal to start; do not begin either without it.
