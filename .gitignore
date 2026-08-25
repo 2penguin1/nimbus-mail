@@ -27,3 +27,6 @@ snooze.exe
 
 # Local scratch
 *.log
+
+# Local agent working notes. Not part of the product.
+CLAUDE.md
